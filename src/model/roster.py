@@ -1,0 +1,789 @@
+"""The projectable roster: who is on the team, where he sits, how often he plays, and how much of
+the field he is on when he does.
+
+The workbook this replaces only carried players who already had a season of history -- 376 of them.
+This module carries every offensive player on a 2026 roster, because a projection that cannot name
+a team's fourth receiver cannot answer what happens when its second one is hurt.
+
+**Two sources, two jobs.** The roster says who is on the team; the depth chart says in what order.
+Neither can do the other's work: the chart lists 84 players who are no longer rostered, and the
+roster lists 61 who are not on the chart. So membership comes from the roster, order comes from the
+chart, and a rostered player the chart omits is slotted *behind* everyone it lists, ranked among his
+fellow omissions by prior opportunity per game and then draft pick -- the same two tie-breakers
+`depth._resolve_slots` already uses inside a tier, and both knowable in August.
+
+**Participation is a product, not a share.** Every rate in `history` is opportunity-weighted over the
+games a player actually played, so a snap share means "when he was out there, this much of the
+offence". What a season needs is that number times how many games he is out there for:
+
+    weekly contribution = expected_games / 17  x  participation when active
+
+Keeping the two apart is what makes the deep roster behave. A ninth receiver's charted history says
+he ran routes on 62% of dropbacks -- true, and useless on its own, because the only ninth receivers
+who ever recorded a route were the ones promoted after an injury. He played 0.3 games. The product,
+0.011 of a week, is the honest answer, and neither factor alone gets close to it.
+
+**Expected games is three questions, not one.** They are kept apart because only the first can be
+fitted on a population that matches the one it is applied to:
+
+- `games_if_available` -- his own durability record blended toward the average games played from his
+  depth slot, the constant grid-searched on 2019-2025 exactly as the shrinkage constants are. This is
+  conditional on turning up in the season at all, because the population it is fitted on is everyone
+  charted in August or seen in a game: the historical `rosters` table carries weekly changes, about
+  four players per team, and no August roster exists before 2026.
+- `presence` -- how often a job that deep exists at all. A 2026 August roster is 90 men, 28.6 of them
+  offensive skill players per team; the population that shows up in a season is 21.9. Somebody has to
+  be the difference and depth slot is the only thing that says who, so this is measured directly:
+  RB4 0.98, RB6 0.49, TE5 0.45, QB4 0.14. Without it the deep tail of a 90-man roster is projected as
+  though every camp body survives the cut, which put team snap sums 13% over the identity.
+- `status_factor` -- the one stated assumption in the module. Only 20 of 2026's 915 offensive players
+  are anything but ACT, and the historical week-1 status column is missing entirely for 2017-2018 and
+  inconsistent elsewhere, so there is nothing honest to fit against. The multipliers live in
+  `Settings.status_availability` where a user can see and move them.
+
+**Rookies get draft capital as a relative statement, not an absolute one.** A rookie has no history,
+so his prior is the whole projection, and the two obvious answers are both marginals of the same
+thing: the depth-slot prior averages over draft capital, the draft curve averages over depth slots.
+Interpolating between them gives a second-round rookie listed third the same prior as one listed
+first, which is how a rookie ends up over the veteran in front of him. So a third estimator is fitted
+alongside them -- his slot's prior scaled by how his draft capital compares with the typical rookie
+holding that job -- and it wins on all three metrics it can be fitted for, by 15-20% over the slot
+prior and 4-12% over the curve. `dropback_share` has too few rookies a season to fit and keeps the
+slot prior, the same auto-revert discipline the team chain uses.
+
+**The diagnostic that matters.** Five skill players are on the field for every snap, so summing
+`games/17 x snap share` over everyone who took one has to come back to five. Measured over the full
+2021-2025 population it is 4.94, the shortfall being only that each player's share is measured
+against his own games rather than the season. That is the number this module reports itself against --
+not the 4.31 that the August-charted subset comes to, because the 2026 roster is the whole population
+and not the subset. It currently lands within 1.2% on all four metrics, with nothing tuned to make it
+do so: the sum is an output of the two fitted factors, which is the only reason it is worth reading.
+
+    python -m src.model.roster --fit       # fit availability, write data/fitted/, print the report
+    python -m src.model.roster --report    # re-print from the saved artifacts
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import UTC, date, datetime
+from functools import lru_cache
+
+import polars as pl
+
+from src.config import (
+    FITTED,
+    HISTORY_FROM,
+    LAST_COMPLETE_SEASON,
+    OFFENSE_POSITIONS,
+    PROJ_SEASON,
+    REG_WEEKS,
+    TEAM_FIXUP,
+    Settings,
+    ensure_dirs,
+)
+from src.data import depth, history, lake
+from src.model import estimate, priors
+from src.model.blend import season_weights, shrink, shrink_weight
+
+# The three field-presence rates plus the quarterback's equivalent. `rush_participation` is an RB
+# statistic in practice -- the play-by-play credits a designed rush to the back, so receivers score a
+# flat zero and the metric simply does not fire for them.
+PARTICIPATION_METRICS = ("snap_share", "route_participation", "rush_participation", "dropback_share")
+
+# Games played collapses with depth in a way participation does not: a fifth receiver plays 10.5
+# games, an eighth half of one. Deep enough to reach the bottom of a real roster; the isotonic
+# smoothing in `slot_games_prior` is what keeps the thin bins down there from misbehaving.
+AVAIL_SLOT_CAP = 12
+
+# Seasons of evidence, so the units are directly readable: k = 1.0 means one full season of a
+# player's own attendance record weighs the same as his slot's average.
+GAMES_K_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 15.0, 1e9)
+
+AVAIL_PATH = FITTED / "availability.json"
+SLOT_GAMES_PATH = FITTED / "availability_slots.parquet"
+
+
+# --------------------------------------------------------------------------- #
+# the roster
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=4)
+def _draft() -> pl.DataFrame:
+    d = lake.read("draft_picks", layer="raw").filter(pl.col("gsis_id").is_not_null())
+    return d.group_by(pl.col("gsis_id").alias("player_id")).agg(
+        pl.col("pick").min().alias("draft_pick_dr"), pl.col("season").min().alias("draft_season_dr")
+    )
+
+
+@lru_cache(maxsize=8)
+def _games_by_team(seasons: tuple[int, ...]) -> pl.DataFrame:
+    """Games a player actually played, per season *and team*.
+
+    Per team rather than per season because a mid-season trade splits a player between two pools, and
+    the pool arithmetic downstream is per team. `history.skill_seasons` assigns him his modal team,
+    which is the wrong answer for exactly this purpose.
+    """
+    frames = []
+    for weeks in (history.skill_weeks(seasons), history.qb_weeks(seasons)):
+        frames.append(
+            weeks.group_by(["season", "team", "player_id"]).agg(
+                pl.col("game_id").n_unique().cast(pl.Float64).alias("games")
+            )
+        )
+    return (
+        pl.concat(frames)
+        .group_by(["season", "team", "player_id"])
+        .agg(pl.col("games").max())     # a QB who also caught a pass appears in both frames
+    )
+
+
+def _age(season: int) -> pl.Expr:
+    """Age on 1 September of the season, in years."""
+    ref = date(season, 9, 1)
+    return (
+        (pl.lit(ref) - pl.col("birth_date").cast(pl.Date, strict=False)).dt.total_days() / 365.25
+    ).alias("age")
+
+
+# A real league-wide snapshot is 32 rosters of about 53. Well under that is a partial file rather
+# than a small league, and taking it at face value would project a season off forty players.
+MIN_SNAPSHOT_ROWS = 1000
+
+
+def _week1_rows(season: int) -> pl.DataFrame:
+    """The earliest full league-wide roster snapshot of `season`.
+
+    Two datasets carry rosters and only one of them is a snapshot in every season. `rosters_weekly`
+    is a genuine week-by-week capture for 2016-2025 but stops at the last complete season, while the
+    `rosters` table we refresh ourselves is the week-1 snapshot for 2026 and, for earlier seasons in
+    the shared lake, a sparse file of a few hundred rows that is not a roster at all. So the weekly
+    capture is preferred where it exists and the size check catches the case where neither is whole --
+    which the backtest needs and the projection never exercised, because 2026 only has the one.
+    """
+    tried = []
+    for dataset in ("rosters_weekly", "rosters"):
+        try:
+            df = lake.read(dataset, layer="raw", seasons=(season,))
+        except FileNotFoundError:
+            continue
+        if "game_type" in df.columns:
+            df = df.filter(pl.col("game_type") == "REG")
+        if "week" in df.columns:
+            df = df.filter(pl.col("week") == pl.col("week").min())
+        tried.append(f"{dataset}={df.height}")
+        if df.height >= MIN_SNAPSHOT_ROWS:
+            return df
+    raise FileNotFoundError(
+        f"no league-wide week-1 roster snapshot for {season} (found {', '.join(tried) or 'nothing'})"
+    )
+
+
+@lru_cache(maxsize=8)
+def roster(season: int = PROJ_SEASON, when: str = "latest") -> pl.DataFrame:
+    """Every offensive player on a `season` roster, with his depth slot resolved.
+
+    One row per player. `charted` says whether the depth chart listed him at this position, and
+    `chart_team` says where -- a disagreement is resolved to the roster, because the roster is the
+    fresher of the two and is the one that decides who is actually on the team.
+    """
+    ros = _week1_rows(season)
+    ros = (
+        ros.filter(pl.col("gsis_id").is_not_null() & pl.col("position").is_in(OFFENSE_POSITIONS))
+        .select(
+            pl.lit(season, pl.Int32).alias("season"),
+            pl.col("team").replace(TEAM_FIXUP).alias("team"),
+            pl.col("gsis_id").alias("player_id"),
+            pl.col("full_name").alias("player"),
+            pl.col("position").replace({"FB": "RB"}).alias("position"),
+            pl.col("position").alias("roster_position"),
+            pl.col("status"),
+            pl.col("years_exp").cast(pl.Int32, strict=False).alias("years_exp"),
+            pl.col("rookie_year").cast(pl.Int32, strict=False).alias("rookie_year"),
+            pl.col("draft_number").cast(pl.Int32, strict=False).alias("draft_number"),
+            pl.col("jersey_number").cast(pl.Int32, strict=False).alias("jersey"),
+            _age(season),
+            pl.col("height").cast(pl.Float64, strict=False).alias("height"),
+            pl.col("weight").cast(pl.Float64, strict=False).alias("weight"),
+        )
+        .sort(["player_id", "team"])
+        .unique(subset=["player_id"], keep="first")
+    )
+
+    chart = depth.depth_chart(season, when)
+    listed = (
+        chart.select(
+            "player_id", "position",
+            pl.col("team").alias("chart_team"),
+            pl.col("depth_tier").alias("chart_tier"),
+            "alignment", "snapshot",
+        )
+        .sort(["player_id", "chart_tier"])
+        .unique(subset=["player_id", "position"], keep="first")
+    )
+    anywhere = set(chart["player_id"].to_list())
+
+    ros = ros.join(listed, on=["player_id", "position"], how="left").with_columns(
+        pl.col("chart_tier").is_not_null().alias("charted"),
+        pl.col("player_id").is_in(anywhere).alias("charted_anywhere"),
+    )
+
+    # An omitted player sits one tier below the deepest the chart names at his position, so he ranks
+    # behind every listed player and among the other omissions by the usual tie-breakers.
+    behind = pl.col("chart_tier").max().over(["team", "position"]).fill_null(0) + 1
+    ros = ros.with_columns(pl.coalesce("chart_tier", behind).cast(pl.Int32).alias("depth_tier"))
+
+    cap = pl.col("position").replace_strict(priors.SLOT_CAP, default=4, return_dtype=pl.Int32)
+    out = depth._resolve_slots(ros, season).with_columns(
+        pl.min_horizontal("depth_slot", cap).alias("slot_bucket"),
+        pl.min_horizontal("depth_slot", pl.lit(AVAIL_SLOT_CAP, pl.Int32)).alias("avail_slot"),
+        pl.coalesce("draft_pick", "draft_number").alias("draft_pick"),
+        (
+            (pl.col("years_exp") == 0) | (pl.col("rookie_year") == season)
+        ).fill_null(False).alias("is_rookie"),
+        (pl.col("chart_team") != pl.col("team")).fill_null(False).alias("team_disagreement"),
+    )
+    return out.with_columns(priors._pick_bin()).sort(["team", "position", "depth_slot"])
+
+
+# --------------------------------------------------------------------------- #
+# availability: how many of the 17 does he play
+# --------------------------------------------------------------------------- #
+def _history_games(seasons: tuple[int, ...]) -> pl.DataFrame:
+    """Games played per player-season, summed across teams.
+
+    Across teams because durability is a property of the player: a back who played nine games for one
+    team and six for another was available for fifteen, and that is what predicts next season. The
+    *target* the fit is scored against stays per team, because that is what a team's pool needs
+    filling. Predicting availability and predicting where he does it are different questions.
+    """
+    return _avail_panel(seasons).group_by(["season", "player_id"]).agg(
+        pl.min_horizontal(pl.col("games").sum(), pl.lit(float(REG_WEEKS - 1))).alias("games")
+    )
+
+
+@lru_cache(maxsize=4)
+def _positions(seasons: tuple[int, ...]) -> pl.DataFrame:
+    """Position by player-season from what he actually did, for players no chart listed."""
+    sk = history.skill_seasons(seasons).select("season", "player_id", "position")
+    qb = history.qb_seasons(seasons).select("season", "player_id", pl.lit("QB").alias("position"))
+    return pl.concat([sk, qb]).unique(subset=["season", "player_id"], keep="first")
+
+
+@lru_cache(maxsize=4)
+def _avail_panel(seasons: tuple[int, ...]) -> pl.DataFrame:
+    """One row per player-season-team, over everyone charted in August *or* seen in a game.
+
+    The population is the compromise the data forces. Charted-only would exclude the September
+    signing who played twelve games, and understate how much of a roster's playing time goes to
+    players nobody listed. Played-only would exclude the charted starter who tore an ACL in camp,
+    and a durability record built without him is not a durability record. The union has both, and it
+    is defined identically in every season, which is what a fitted constant needs.
+
+    Games are counted *for that team*: a player traded in October stops filling this pool the day he
+    leaves, and the pool is what the projection has to fill.
+    """
+    played = _games_by_team(seasons)
+    pos = _positions(seasons)
+    frames = []
+    for season in seasons:
+        try:
+            ch = depth.depth_chart(season, "latest" if season >= PROJ_SEASON else "preseason")
+        except (FileNotFoundError, ValueError):
+            continue
+        ch = ch.select("season", "team", "player_id", "position",
+                       pl.col("depth_tier").alias("chart_tier"))
+        extra = (
+            played.filter(pl.col("season") == season)
+            .join(ch.select("season", "team", "player_id"), on=["season", "team", "player_id"],
+                  how="anti")
+            .join(pos, on=["season", "player_id"], how="inner")
+            .select("season", "team", "player_id", "position",
+                    pl.lit(None, pl.Int32).alias("chart_tier"))
+        )
+        u = pl.concat([ch, extra], how="diagonal_relaxed")
+        behind = pl.col("chart_tier").max().over(["team", "position"]).fill_null(0) + 1
+        u = u.with_columns(pl.coalesce("chart_tier", behind).cast(pl.Int32).alias("depth_tier"))
+        frames.append(depth._resolve_slots(u, season))
+    panel = pl.concat(frames, how="diagonal_relaxed")
+    return (
+        panel.join(played, on=["season", "team", "player_id"], how="left")
+        .with_columns(
+            pl.col("games").fill_null(0.0),
+            pl.min_horizontal("depth_slot", pl.lit(AVAIL_SLOT_CAP, pl.Int32)).alias("avail_slot"),
+            pl.col("chart_tier").is_not_null().alias("charted"),
+        )
+        .select("season", "team", "player_id", "position", "depth_slot", "avail_slot", "charted",
+                "games")
+    )
+
+
+def slot_games_prior(panel: pl.DataFrame, before: int) -> pl.DataFrame:
+    """Average games played by (position, slot), from seasons strictly before `before`.
+
+    Smoothed to be non-increasing in slot. Deeper means less playing time in aggregate; a bin that
+    says otherwise is a handful of promoted backups, and pooling the offending neighbours removes it
+    without inventing a functional form.
+    """
+    h = panel.filter(pl.col("season") < before)
+    agg = (
+        h.group_by(["position", "avail_slot"])
+        .agg(pl.col("games").mean().alias("raw_games"), pl.len().alias("n"))
+        .sort(["position", "avail_slot"])
+    )
+    rows = []
+    for pos in agg["position"].unique().sort():
+        sub = agg.filter(pl.col("position") == pos)
+        smooth = priors._isotonic_decreasing(
+            sub["raw_games"].to_list(), [float(n) for n in sub["n"].to_list()]
+        )
+        for slot, raw, sm, n in zip(
+            sub["avail_slot"].to_list(), sub["raw_games"].to_list(), smooth, sub["n"].to_list(),
+            strict=True,
+        ):
+            rows.append({
+                "position": pos, "avail_slot": int(slot), "raw_games": float(raw),
+                "prior_games": float(sm), "n": int(n),
+            })
+    return pl.DataFrame(rows)
+
+
+def slot_presence(panel: pl.DataFrame, before: int) -> pl.DataFrame:
+    """The share of team-seasons in which a player this deep turns up in the season at all.
+
+    This is the one thing the depth-slot games prior cannot say on its own, and the reason a naive
+    version over-projects the bottom of a roster. The prior is conditional -- it averages over players
+    who were charted in August or who played, so an eleventh receiver in it is an eleventh receiver
+    who got promoted, and he played five games. A 90-man August roster in 2026 has twelve receivers
+    on it and most of them will be cut before week 1.
+
+    Measured as the count of panel rows at a slot over 32 team-seasons, so a slot every team fills
+    reads 1.0 and one that turns up eight times in five years reads 0.05, and smoothed to be
+    non-increasing because a deeper job cannot be more likely to exist than a shallower one. It is
+    applied as a separate named factor rather than folded into the prior, so the number a user reads
+    as "games when he is on the field" stays the number that was actually fitted.
+    """
+    h = panel.filter(pl.col("season") < before)
+    n = h["season"].n_unique()
+    if not n:
+        return pl.DataFrame(schema={"position": pl.String, "avail_slot": pl.Int32,
+                                    "presence": pl.Float64})
+    agg = (
+        h.group_by(["position", "avail_slot"])
+        .agg((pl.len() / (32.0 * n)).clip(upper_bound=1.0).alias("raw"))
+        .sort(["position", "avail_slot"])
+    )
+    rows = []
+    for pos in agg["position"].unique().sort():
+        sub = agg.filter(pl.col("position") == pos)
+        smooth = priors._isotonic_decreasing(sub["raw"].to_list(), [1.0] * sub.height)
+        for slot, p in zip(sub["avail_slot"].to_list(), smooth, strict=True):
+            rows.append({"position": pos, "avail_slot": int(slot), "presence": float(p)})
+    return pl.DataFrame(rows)
+
+
+def _join_slot_prior(df: pl.DataFrame, prior: pl.DataFrame) -> pl.DataFrame:
+    """Attach `prior_games` and `presence`, falling back to the deepest slot seen at that position."""
+    cols = [c for c in ("prior_games", "presence") if c in prior.columns]
+    deepest = (
+        prior.sort(["position", "avail_slot"])
+        .group_by("position")
+        .agg(*[pl.col(c).last().alias(f"_deep_{c}") for c in cols])
+    )
+    out = (
+        df.join(prior.select("position", "avail_slot", *cols), on=["position", "avail_slot"],
+                how="left")
+        .join(deepest, on="position", how="left")
+        .with_columns(*[pl.coalesce(c, f"_deep_{c}", pl.lit(0.0)).alias(c) for c in cols])
+        .drop([f"_deep_{c}" for c in cols])
+    )
+    if "presence" not in out.columns:
+        out = out.with_columns(pl.lit(1.0).alias("presence"))
+    return out
+
+
+def _own_games(hist: pl.DataFrame, target: int, settings: Settings) -> pl.DataFrame:
+    """A player's recency-weighted attendance record from before `target`.
+
+    `n_seasons` is the weight actually available divided by the full weight vector, so one season of
+    history reads as 0.5 of the evidence three do -- which is what a fitted `k` in season units
+    trades against.
+    """
+    total = float(sum(settings.recency))
+    h = hist.with_columns(season_weights("season", target, settings.recency)).filter(
+        pl.col("recency_weight") > 0
+    )
+    if h.is_empty():
+        return pl.DataFrame(schema={"player_id": pl.String, "obs_games": pl.Float64,
+                                    "n_seasons": pl.Float64, "seasons_seen": pl.UInt32})
+    return h.group_by("player_id").agg(
+        (
+            (pl.col("games") * pl.col("recency_weight")).sum() / pl.col("recency_weight").sum()
+        ).alias("obs_games"),
+        (pl.col("recency_weight").sum() / total).alias("n_seasons"),
+        pl.col("season").n_unique().alias("seasons_seen"),
+    )
+
+
+def fit_availability(settings: Settings | None = None) -> dict:
+    """Grid-search the games blending constant on held-out seasons.
+
+    Scored in games, against the two things it blends: the player's own record alone (`k = 0`) and
+    his slot's average alone (`k = inf`). If neither endpoint is beaten there is no case for the
+    blend, and the report says so rather than burying it.
+    """
+    settings = settings or Settings()
+    seasons = tuple(range(HISTORY_FROM, LAST_COMPLETE_SEASON + 1))
+    panel = _avail_panel(seasons)
+    hist = _history_games(seasons)
+
+    frames = []
+    for target in range(priors.FIT_FIRST_TARGET, LAST_COMPLETE_SEASON + 1):
+        cur = panel.filter(pl.col("season") == target)
+        if cur.is_empty():
+            continue
+        frames.append(
+            _join_slot_prior(cur, slot_games_prior(panel, before=target))
+            .join(_own_games(hist, target, settings), on="player_id", how="left")
+        )
+    scored = pl.concat(frames, how="diagonal_relaxed")
+
+    def mae(k: float) -> float:
+        e = scored.select(
+            (shrink("obs_games", "prior_games", "n_seasons", k) - pl.col("games")).abs().alias("e")
+        )["e"]
+        return float(e.mean())
+
+    grid = [(k, mae(k)) for k in GAMES_K_GRID]
+    best_k, best = min(grid, key=lambda t: t[1])
+    own, prior_only = mae(0.0), mae(1e9)
+    return {
+        "fitted_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "seasons": [priors.FIT_FIRST_TARGET, LAST_COMPLETE_SEASON],
+        "k": best_k if best_k < 1e8 else float("inf"),
+        "mae": best, "mae_own_record": own, "mae_slot_prior": prior_only,
+        "gain_vs_own_pct": 100.0 * (own - best) / own if own else 0.0,
+        "gain_vs_prior_pct": 100.0 * (prior_only - best) / prior_only if prior_only else 0.0,
+        "n": int(scored.height),
+        "grid": {str(k): m for k, m in grid},
+    }
+
+
+def load_availability() -> dict:
+    return json.loads(AVAIL_PATH.read_text()) if AVAIL_PATH.is_file() else {}
+
+
+@lru_cache(maxsize=1)
+def load_slot_games() -> pl.DataFrame:
+    return pl.read_parquet(SLOT_GAMES_PATH) if SLOT_GAMES_PATH.is_file() else pl.DataFrame()
+
+
+def slot_games_as_of(before: int) -> pl.DataFrame:
+    """The depth-slot games prior and presence rate, from seasons strictly before `before`.
+
+    The saved parquet is the same thing fitted through the last complete season. This rebuilds it for
+    a held-out target so that a 2022 twelfth receiver's survival odds are not informed by 2024.
+    """
+    panel = _avail_panel(tuple(range(HISTORY_FROM, before)))
+    return slot_games_prior(panel, before=before).join(
+        slot_presence(panel, before=before), on=["position", "avail_slot"], how="left"
+    )
+
+
+def availability(
+    season: int = PROJ_SEASON,
+    settings: Settings | None = None,
+    ros: pl.DataFrame | None = None,
+    fitted: priors.Fitted | None = None,
+) -> pl.DataFrame:
+    """Expected games for every rostered player, before and after roster status and roster survival.
+
+    Three numbers, kept apart on purpose, because they answer three questions and only the first is
+    fitted on a population that matches its use:
+
+    - `games_if_available` -- the blend of his own attendance record and his slot's average. This is
+      the fitted quantity, and it is *conditional on being in the season at all*.
+    - `presence` -- how often a job that deep exists on an in-season roster. A 90-man August roster
+      carries about 28.6 offensive players per team; the population that appears in a season is about
+      21.9. Somebody has to be the difference, and depth slot is the only thing that says who.
+    - `status_factor` -- the stated multiplier for anyone not ACT.
+
+    `expected_games` is their product. Reading them separately is what lets a user see that a twelfth
+    receiver's low projection is a roster-survival judgement rather than an injury one.
+    """
+    settings = settings or Settings()
+    ros = roster(season) if ros is None else ros
+    k = fitted.games_k if fitted is not None and fitted.games_k is not None else \
+        load_availability().get("k")
+    k = settings.default_share_k if k is None else float(k)
+
+    prior = fitted.slot_games if fitted is not None else load_slot_games()
+    if prior.is_empty():
+        panel = _avail_panel(tuple(range(HISTORY_FROM, season)))
+        prior = slot_games_prior(panel, before=season).join(
+            slot_presence(panel, before=season), on=["position", "avail_slot"], how="left"
+        )
+    hist = _history_games(tuple(range(HISTORY_FROM, season)))
+
+    out = (
+        _join_slot_prior(ros, prior)
+        .join(_own_games(hist, season, settings), on="player_id", how="left")
+        .with_columns(
+            shrink("obs_games", "prior_games", "n_seasons", k).alias("games_if_available"),
+            shrink_weight("n_seasons", k).alias("games_own_weight"),
+        )
+        .with_columns(
+            pl.col("status")
+            .replace_strict(settings.status_availability, default=1.0, return_dtype=pl.Float64)
+            .alias("status_factor")
+        )
+    )
+    return out.with_columns(
+        pl.min_horizontal(
+            pl.col("games_if_available") * pl.col("presence") * pl.col("status_factor"),
+            pl.lit(float(REG_WEEKS - 1)),
+        ).clip(lower_bound=0.0).alias("expected_games")
+    ).with_columns((pl.col("expected_games") / float(REG_WEEKS - 1)).alias("active_weeks"))
+
+
+# --------------------------------------------------------------------------- #
+# participation: how much of the offence when he is out there
+# --------------------------------------------------------------------------- #
+def participation_detail(
+    season: int = PROJ_SEASON,
+    settings: Settings | None = None,
+    ros: pl.DataFrame | None = None,
+    fitted: priors.Fitted | None = None,
+) -> pl.DataFrame:
+    """One row per player per participation metric, showing every input to the answer.
+
+    `obs` is the player, `prior` is his job, `used` is the blend, and `own_weight` is how much of
+    `used` is him -- the four numbers a user needs to decide whether to override it. The arithmetic is
+    `estimate.estimate`, which every other share and rate in the projection also goes through.
+    """
+    ros = roster(season) if ros is None else ros
+    return estimate.estimate(PARTICIPATION_METRICS, ros, season, settings, fitted)
+
+
+def participation(
+    season: int = PROJ_SEASON,
+    settings: Settings | None = None,
+    ros: pl.DataFrame | None = None,
+    fitted: priors.Fitted | None = None,
+) -> pl.DataFrame:
+    """One row per rostered player: his depth, his expected games, and his participation rates.
+
+    This is what `opportunity.py` consumes. `weekly_*` columns are the availability-weighted
+    contribution -- participation times the fraction of the season he is there for -- which is the
+    quantity that has to add up across a team.
+    """
+    settings = settings or Settings()
+    ros = roster(season) if ros is None else ros
+    avail = availability(season, settings, ros=ros, fitted=fitted)
+    detail = participation_detail(season, settings, ros=ros, fitted=fitted)
+
+    wide = detail.pivot(on="metric", index="player_id", values="used")
+    have = [m for m in PARTICIPATION_METRICS if m in wide.columns]
+    out = avail.join(wide, on="player_id", how="left")
+    return out.with_columns(
+        *[(pl.col(m).fill_null(0.0) * pl.col("active_weeks")).alias(f"weekly_{m}") for m in have]
+    ).select(
+        "season", "team", "player_id", "player", "position", "roster_position", "status",
+        "depth_tier", "depth_slot", "slot_bucket", "avail_slot", "charted", "charted_anywhere",
+        "team_disagreement", "alignment", "is_rookie", "draft_pick", "pick_bin", "years_exp", "age",
+        "height", "weight", "prior_opp_per_game",
+        "prior_games", "obs_games", "n_seasons", "games_own_weight", "games_if_available",
+        "presence", "status_factor", "expected_games", "active_weeks",
+        *have, *[f"weekly_{m}" for m in have],
+    ).sort(["team", "position", "depth_slot"])
+
+
+# --------------------------------------------------------------------------- #
+# diagnostics
+# --------------------------------------------------------------------------- #
+def measure_benchmark(seasons: tuple[int, ...] | None = None) -> dict[str, float]:
+    """What the availability-weighted participation sum actually comes to, per team-week.
+
+    Over everyone who recorded anything, which is the population the 2026 roster corresponds to, and
+    with exactly the arithmetic the projection uses. Five skill players are on the field for every
+    snap, so this is the 5.0 identity net of the fact that each player's share is measured against
+    his own games rather than the season -- which is why it reads 4.95 and not 5.00.
+    """
+    seasons = seasons or tuple(range(2021, LAST_COMPLETE_SEASON + 1))
+    out: dict[str, float] = {}
+    for name in PARTICIPATION_METRICS:
+        metric = priors.BY_NAME[name]
+        use = tuple(s for s in seasons if s >= metric.since)
+        hist = priors._hist(metric.table)
+        if not use or name not in hist.columns:
+            continue
+        per_team = (
+            hist.filter(pl.col("season").is_in(use))
+            .with_columns(
+                (pl.col(name).fill_null(0.0) * pl.col("games") / float(REG_WEEKS - 1)).alias("w")
+            )
+            .group_by(["season", "team"])
+            .agg(pl.col("w").sum())
+        )
+        out[name] = float(per_team["w"].mean())
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# rookies: how much of the prior is draft capital
+def team_diagnostic(part: pl.DataFrame, benchmark: dict[str, float]) -> pl.DataFrame:
+    """Per-team weekly participation sums against the measured benchmark."""
+    cols = [c for c in part.columns if c.startswith("weekly_")]
+    per_team = part.group_by("team").agg(
+        pl.len().alias("players"),
+        pl.col("expected_games").sum().alias("player_games"),
+        *[pl.col(c).sum() for c in cols],
+    )
+    rows = []
+    for c in cols:
+        name = c.removeprefix("weekly_")
+        bm = benchmark.get(name)
+        rows.append({
+            "metric": name,
+            "projected_mean": float(per_team[c].mean()),
+            "projected_min": float(per_team[c].min()),
+            "projected_max": float(per_team[c].max()),
+            "benchmark": bm,
+            "gap_pct": 100.0 * (float(per_team[c].mean()) - bm) / bm if bm else None,
+        })
+    return pl.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# fit, save, report
+# --------------------------------------------------------------------------- #
+def fit_all(settings: Settings | None = None) -> dict:
+    settings = settings or Settings()
+    ensure_dirs()
+    seasons = tuple(range(HISTORY_FROM, LAST_COMPLETE_SEASON + 1))
+
+    fit = fit_availability(settings)
+    panel = _avail_panel(seasons)
+    slot_prior = slot_games_prior(panel, before=PROJ_SEASON).join(
+        slot_presence(panel, before=PROJ_SEASON), on=["position", "avail_slot"], how="left"
+    )
+
+    fit["benchmark"] = measure_benchmark()
+    fit["population_per_team"] = float(
+        panel.filter(pl.col("season") >= 2021).group_by(["season", "team"]).len()["len"].mean()
+    )
+
+    slot_prior.write_parquet(SLOT_GAMES_PATH)
+    load_slot_games.cache_clear()
+    AVAIL_PATH.write_text(json.dumps(fit, indent=2))
+
+    part = participation(PROJ_SEASON, settings)
+    return {
+        "fit": fit, "slot_prior": slot_prior, "participation": part,
+        "rookie_blend": priors.load_rookie_blend(),
+        "diagnostic": team_diagnostic(part, fit["benchmark"]),
+    }
+
+
+def clear_cache() -> None:
+    roster.cache_clear()
+    _games_by_team.cache_clear()
+    _draft.cache_clear()
+    load_slot_games.cache_clear()
+
+
+def _report(art: dict) -> None:
+    pl.Config.set_tbl_width_chars(210)
+    pl.Config.set_tbl_rows(60)
+    pl.Config.set_fmt_float("mixed")
+    fit, part = art["fit"], art["participation"]
+
+    print(f"\nROSTER {PROJ_SEASON}   {part.height} offensive players, {part['team'].n_unique()} teams")
+    print(part.group_by("position").agg(
+        pl.len().alias("players"),
+        pl.col("charted").sum().alias("charted"),
+        (~pl.col("charted")).sum().alias("unlisted"),
+        pl.col("team_disagreement").sum().alias("team_moved"),
+        pl.col("is_rookie").sum().alias("rookies"),
+        pl.col("draft_pick").is_not_null().sum().alias("drafted"),
+        pl.col("expected_games").mean().round(2).alias("exp_games"),
+    ).sort("position"))
+    bad = part.filter(pl.col("status") != "ACT")
+    if not bad.is_empty():
+        print(part.group_by("status").agg(
+            pl.len(), pl.col("status_factor").first().round(2),
+            pl.col("expected_games").mean().round(2).alias("exp_games"),
+        ).sort("len", descending=True))
+
+    print("\nAVAILABILITY  expected games, blend of own record and depth slot  (MAE in games)")
+    print(pl.DataFrame([{
+        "k_seasons": fit["k"], "mae": round(fit["mae"], 3),
+        "mae_own_record": round(fit["mae_own_record"], 3),
+        "mae_slot_prior": round(fit["mae_slot_prior"], 3),
+        "gain_vs_own_%": round(fit["gain_vs_own_pct"], 1),
+        "gain_vs_prior_%": round(fit["gain_vs_prior_pct"], 1),
+        "n": fit["n"],
+    }]))
+    sp = art["slot_prior"]
+    print("  games when he is in the season (left) x how often a job that deep exists (right)")
+    print(sp.pivot(on="position", index="avail_slot", values="prior_games")
+          .join(sp.pivot(on="position", index="avail_slot", values="presence"),
+                on="avail_slot", suffix="_present")
+          .sort("avail_slot").select(pl.all().round(2)))
+
+    blend = art.get("rookie_blend") or {}
+    rook = [{"metric": m, "form": blend[m][0], "w": blend[m][1]}
+            for m in PARTICIPATION_METRICS if m in blend]
+    if rook:
+        print("\nROOKIE PRIORS  fitted in priors.py -- see python -m src.model.priors --report")
+        print(pl.DataFrame(rook))
+
+    detail = participation_detail(PROJ_SEASON)
+    print("\nPARTICIPATION  how much of each answer is the player rather than his job")
+    print(detail.group_by("metric").agg(
+        pl.col("k").first(),
+        pl.col("used").mean().round(3).alias("mean_used"),
+        pl.col("own_weight").mean().round(2).alias("mean_own_weight"),
+        (pl.col("source") == "blend").sum().alias("from_blend"),
+        (pl.col("source") == "slot_prior").sum().alias("from_slot"),
+        (pl.col("source") == "draft_blend").sum().alias("from_draft"),
+    ).sort("metric"))
+
+    print(f"\nTEAM SUMS  availability-weighted participation per week, vs the identity measured over"
+          f" the whole population\n           ({fit.get('population_per_team', 0):.1f} players per"
+          f" team in the fitted population, {part.height / 32:.1f} on a 2026 roster)")
+    print(art["diagnostic"].with_columns(pl.col("^projected.*$").round(3),
+                                         pl.col("benchmark").round(3),
+                                         pl.col("gap_pct").round(1)))
+
+    print("\nPHI, as an example")
+    print(part.filter(pl.col("team") == "PHI").select(
+        "position", "depth_slot", "player", "status", "is_rookie", "draft_pick",
+        pl.col("expected_games").round(1),
+        *[pl.col(c).round(3) for c in PARTICIPATION_METRICS if c in part.columns],
+    ).head(22))
+    print(f"\nwritten to {FITTED}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--fit", action="store_true", help="refit availability and write artifacts")
+    p.add_argument("--report", action="store_true", help="print from the saved artifacts")
+    args = p.parse_args(argv)
+    if args.report and not args.fit:
+        fit = load_availability()
+        part = participation(PROJ_SEASON)
+        art = {
+            "fit": fit, "slot_prior": load_slot_games(), "participation": part,
+            "rookie_blend": priors.load_rookie_blend(),
+            "diagnostic": team_diagnostic(part, fit.get("benchmark", {})),
+        }
+    else:
+        art = fit_all()
+    _report(art)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

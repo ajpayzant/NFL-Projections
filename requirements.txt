@@ -1,0 +1,18 @@
+# The engine and the app. Lower bounds rather than pins: nothing here is used near an edge, and a pinned
+# minor version ages into a conflict with the shared lake's own environment.
+polars>=1.30
+numpy>=2.0
+pyarrow>=17.0            # reading the parquet lake
+streamlit>=1.40
+pandas>=2.2              # only for st.dataframe's column_config path
+xlsxwriter>=3.2          # the formatted multi-sheet export
+requests>=2.32           # the nflverse refresh
+
+# Optional. Google Sheets export degrades to "configure credentials" without these; every other
+# destination works.
+gspread>=6.0
+google-auth>=2.30
+
+# Development.
+pytest>=8.0
+openpyxl>=3.1            # tests read back the workbook the export writes

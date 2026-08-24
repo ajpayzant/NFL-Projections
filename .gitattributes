@@ -1,0 +1,7 @@
+# LF in the repository, whatever the working copy does. Developed on Windows, so without this every
+# file would land in a commit twice over.
+* text=auto eol=lf
+
+# Parquet is not text and must never be filtered.
+*.parquet binary
+*.xlsx binary

@@ -1,0 +1,31 @@
+# Environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Scratch. Diagnostic parquets and throwaway workbooks live here; nothing under build/ is an input.
+build/
+
+# Refreshable inputs. `python -m src.data.refresh` rewrites these from nflverse in under a minute, and a
+# committed roster snapshot is a stale roster snapshot the moment somebody signs.
+data/raw/
+data/cache/
+
+# A user's own scenarios are their working state, not the project's.
+data/scenarios/
+
+# Credentials. The Google Sheets export reads a service account from $NFLSP_GSPREAD_JSON or
+# ~/.config/nflsp/service-account.json, both outside this tree on purpose. This is belt and braces.
+*service-account*.json
+*.pem
+.env
+
+# The other repo's Excel workbooks, if one is ever built in here by mistake.
+*.xlsx
+
+# OS noise
+.DS_Store
+Thumbs.db

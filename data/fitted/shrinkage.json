@@ -1,0 +1,52 @@
+{
+  "fitted_at": "2026-08-24T01:43:58+00:00",
+  "history": [
+    2016,
+    2025
+  ],
+  "targets_from": 2019,
+  "recency": [
+    5.0,
+    3.0,
+    2.0
+  ],
+  "k": {
+    "target_share": 35.0,
+    "carry_share": 10.0,
+    "air_yards_share": 400.0,
+    "rz_target_share": 10.0,
+    "rz_carry_share": 10.0,
+    "inside_5_carry_share": 2.0,
+    "short_yardage_carry_share": 5.0,
+    "late_down_target_share": 20.0,
+    "rec_td_share": 10.0,
+    "rush_td_share": 5.0,
+    "snap_share": 60.0,
+    "route_participation": 35.0,
+    "rush_participation": 20.0,
+    "catch_rate": 35.0,
+    "yards_per_target": 100.0,
+    "yards_per_carry": 160.0,
+    "adot": 20.0,
+    "tprr": 100.0,
+    "rush_success_rate": 160.0,
+    "fumble_rate": 400.0,
+    "dropback_share": 35.0,
+    "attempt_rate": 60.0,
+    "completion_pct": 250.0,
+    "yards_per_attempt": 400.0,
+    "pass_td_rate": 400.0,
+    "int_rate": 1000.0,
+    "sack_rate": 160.0,
+    "scramble_rate": 60.0,
+    "air_yards_per_attempt": 250.0,
+    "designed_rush_share": 35.0,
+    "clean_rush_share": 35.0,
+    "yards_per_clean_rush": 20.0,
+    "pass_td_share": 0.0,
+    "scramble_ypc": 60.0,
+    "designed_rush_ypc": 2.0,
+    "qb_rush_td_share": 5.0,
+    "qb_fumble_rate": 1000.0
+  }
+}
