@@ -98,11 +98,17 @@ def ratio(num: str, den: str, alias: str) -> pl.Expr:
     )
 
 
-def shrink(obs: str | pl.Expr, prior: str | pl.Expr, n: str | pl.Expr, k: float) -> pl.Expr:
+def shrink(
+    obs: str | pl.Expr, prior: str | pl.Expr, n: str | pl.Expr, k: float | pl.Expr
+) -> pl.Expr:
     """`(n·obs + k·prior) / (n + k)`, falling back to the prior where the player has no sample.
 
     `k` is in the units of `n`. A missing observation is not zero evidence pulled to zero; it is no
     evidence, so the answer is the prior.
+
+    `k` may be an expression rather than a scalar, for the one fit that needs a different constant for
+    different rows: availability is fitted separately for first-string jobs and for the bench, because
+    those two populations are not the same shape. See `roster.fit_availability`.
     """
     obs_e = pl.col(obs) if isinstance(obs, str) else obs
     prior_e = pl.col(prior) if isinstance(prior, str) else prior
@@ -115,7 +121,7 @@ def shrink(obs: str | pl.Expr, prior: str | pl.Expr, n: str | pl.Expr, k: float)
     )
 
 
-def shrink_weight(n: str | pl.Expr, k: float) -> pl.Expr:
+def shrink_weight(n: str | pl.Expr, k: float | pl.Expr) -> pl.Expr:
     """The `n/(n+k)` fraction itself -- worth surfacing so a user can see how much of a number is
     the player and how much is his position.
 

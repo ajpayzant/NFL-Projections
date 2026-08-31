@@ -1,0 +1,13 @@
+# Streamlit config for the NFL season projections app.
+#
+# port is pinned on purpose. Streamlit's default is 8501, which is a shared
+# free-for-all: whichever app starts first wins it, and other tools' launchers
+# that probe "is anything listening on 8501?" will then open THIS app by
+# mistake. That is what broke the PLL Pricing Tool shortcut. This app owns
+# 8611. See ~/PORTS.md for the machine-wide registry.
+[server]
+port = 8611
+headless = true
+
+[browser]
+gatherUsageStats = false

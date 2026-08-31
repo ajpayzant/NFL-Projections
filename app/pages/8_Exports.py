@@ -18,14 +18,18 @@ Two things are deliberately different from the display:
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
-import polars as pl
-import streamlit as st
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import ui
-from src.config import PROJ_SEASON
-from src.export import sheets
+import polars as pl                                                          # noqa: E402
+import streamlit as st                                                       # noqa: E402
+
+import ui                                                                    # noqa: E402
+from src.config import PROJ_SEASON                                           # noqa: E402
+from src.export import sheets                                                # noqa: E402
 
 view = ui.controls("Exports", icon="📤")
 ui.scenario_banner(view)
@@ -79,31 +83,46 @@ DEFAULT_CHOICE = ["board", "season", "weekly"]
 # --------------------------------------------------------------------------- #
 # what to export
 # --------------------------------------------------------------------------- #
-left, right = st.columns([3, 2])
-with left:
-    chosen = st.multiselect(
-        "Tables", list(TABLES), default=DEFAULT_CHOICE,
-        help="Each becomes a sheet in the workbook and a CSV of its own.",
-    )
-with right:
-    stem = st.text_input("File name", value=f"nfl_{PROJ_SEASON}_projections")
+ui.section(
+    "What leaves is what is on screen",
+    "Every table offered here comes from the same cached run every other page reads, under the live "
+    "scenario and through the filters set below — so an export cannot quietly disagree with the board "
+    "you were just looking at. Two things are deliberately different from the display: the numbers go "
+    "at **full precision** rather than rounded for reading, and **every column** goes rather than the "
+    "ones a page chose to show, because the one column somebody needs is always the hidden one.",
+    sub=f"season {view.season} · {len(TABLES)} tables the engine can write",
+    level=2,
+)
 
-st.caption("Filters below apply to the player-level tables. The team and audit tables are exported "
-           "whole — a per-pool audit filtered to one position is not an audit.")
-fl, fm, fr = st.columns([2, 2, 3])
-with fl:
-    positions = ui.position_filter("exp_pos")
-with fm:
-    teams = ui.team_filter(view, "exp_team")
-with fr:
-    search = st.text_input("Search", placeholder="part of a name", key="exp_search")
+with st.container(border=True):
+    left, right = st.columns([3, 2])
+    with left:
+        chosen = st.multiselect(
+            "Tables", list(TABLES), default=DEFAULT_CHOICE,
+            help="Each becomes a sheet in the workbook and a CSV of its own.",
+        )
+    with right:
+        stem = st.text_input("File name", value=f"nfl_{PROJ_SEASON}_projections")
 
-only_startable = st.toggle("Startable only", value=False, key="exp_startable",
-                           help=f"Inside the position's starter count: {view.settings.starters}")
+    fl, fm, fr = st.columns([2, 2, 3])
+    with fl:
+        positions = ui.position_filter("exp_pos")
+    with fm:
+        teams = ui.team_filter(view, "exp_team")
+    with fr:
+        search = st.text_input("Search", placeholder="part of a name", key="exp_search")
 
-# The simulated ranges are offered only when they exist. Simulating just to export would be a
-# ten-second surprise behind a download button.
-sim = ui.sim_controls(view, key="exp_sim")
+    tog, why = st.columns([2, 5], vertical_alignment="center")
+    with tog:
+        only_startable = st.toggle("Startable only", value=False, key="exp_startable",
+                                   help=f"Inside the position's starter count: {view.settings.starters}")
+    with why:
+        ui.chips("filters apply to the player-level tables",
+                 "team and audit tables go whole — a filtered audit is not an audit")
+
+    # The simulated ranges are offered only when they exist. Simulating just to export would be a
+    # ten-second surprise behind a download button.
+    sim = ui.sim_controls(view, key="exp_sim")
 
 # --------------------------------------------------------------------------- #
 # build the set
@@ -145,11 +164,23 @@ if not len(exports):
 # --------------------------------------------------------------------------- #
 # what is going
 # --------------------------------------------------------------------------- #
-st.subheader("What is going")
 manifest = pl.DataFrame([
     {"table": s.name, "rows": s.frame.height, "columns": s.frame.width,
      "not in CSV": ", ".join(sheets.dropped_columns(s.frame)), "what it is": s.note}
     for s in exports.sheets
+])
+ui.section("What is going",
+           "One row per sheet: how many rows it carries, how wide it is, and the line that will be "
+           "written into the workbook's README beside it.",
+           sub=f"{len(exports)} sheets · under the live scenario and the filters above")
+ui.tiles([
+    {"name": "sheets", "value": len(exports), "digits": 0, "sub": "one per table chosen"},
+    {"name": "rows in all", "value": int(manifest["rows"].sum()), "digits": 0,
+     "highlight": True, "sub": "at full precision, not rounded"},
+    {"name": "widest table", "value": int(manifest["columns"].max()), "digits": 0,
+     "sub": f"{manifest.sort('columns', descending=True).row(0, named=True)['table']} · columns"},
+    {"name": "ranges included", "value": None,
+     "sub": "yes — the simulation is on" if sim is not None else "no — turn Ranges on above"},
 ])
 ui.table(manifest, height="auto")
 lost = [c for s in exports.sheets for c in sheets.dropped_columns(s.frame)]
@@ -165,7 +196,10 @@ provenance = ui.sim_provenance()
 # --------------------------------------------------------------------------- #
 # download
 # --------------------------------------------------------------------------- #
-st.subheader("Download")
+ui.section("Take it with you",
+           "The workbook is the one to send: formatted, one sheet per table, with a README naming the "
+           "scenario, the season and the moment it was written. A CSV is the one to compute with.",
+           sub=f"{scenario_label} · written {stamp}")
 book, single = st.columns([2, 3])
 
 with book:
@@ -196,7 +230,11 @@ with single:
 # --------------------------------------------------------------------------- #
 # Google Sheets
 # --------------------------------------------------------------------------- #
-st.subheader("Google Sheets")
+ui.section("Google Sheets",
+           "The same set written to a live spreadsheet instead of a file, for a league that shares one. "
+           "A service account is looked for outside this repository on purpose, so a private key cannot "
+           "be committed by accident.",
+           sub="optional — a file works without any of this")
 status = sheets.sheets_status()
 
 if not status.ready:

@@ -19,12 +19,20 @@ and a lateral puts a carry on a receiver's line without leaving the carries pool
 is the sum actually observed over 2016-2025, and normalization scales toward that. Nothing is tuned to
 make it come out at 1; the report shows how close each pool gets on its own.
 
+**A pool only one man can take is a queue, not a committee.** Where several players genuinely share a
+pool, a room that claims 106% is best read as everyone being slightly high, so the correction is
+proportional. A dropback is not like that -- one quarterback takes it, and the depth chart is a strict
+order -- so an over-claiming room there is an over-claiming *backup*, and charging the starter a share
+of it made the model contradict its own availability estimate. Those pools are filled in depth order
+instead; see `Pool.queue`.
+
     python -m src.model.opportunity            # per-pool audit for 2026, before and after scaling
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
@@ -43,12 +51,24 @@ class Pool:
     routes are shared -- five players are on the field for the same snap -- and designed runs are only
     partly claimed, since the QB's slice is fitted but the handoff's owner is folded into his overall
     carry share. Normalizing either kind would scale a number toward a total it was never measuring.
+
+    `queue` says *how* an exclusive pool is divided when the claims do not add up. The default is
+    proportional, which is right for a pool several men genuinely share: if a team's receivers claim
+    106% of its targets, the honest reading is that each of them is a little high. It is wrong for a
+    pool exactly one man can take. A dropback goes to one quarterback, and the depth chart is a strict
+    order, so a room that over-claims is a *backup* who is over-claiming -- and scaling proportionally
+    charges the starter for it. Under a queue the first-stringer is filled to his claim, the next man
+    gets only what is left, and the error lands where it belongs. See `_queue_alloc`.
+
+    A queued pool must be claimed by one position only; `tests/test_opportunity.py` asserts it, since
+    the queue reads `depth_slot`, which is ranked within a position and not across the offence.
     """
 
     name: str                     # the player-level count this produces
     team_col: str                 # the per-game column in `team.game_environment`
     shares: tuple[str, ...]       # share metrics that divide it, across positions
     exclusive: bool = True
+    queue: bool = False
 
 
 POOLS = (
@@ -61,9 +81,9 @@ POOLS = (
     Pool("short_yardage_carries", "short_yardage_carries", ("short_yardage_carry_share",)),
     Pool("late_down_targets", "late_down_targets", ("late_down_target_share",)),
     Pool("receiving_tds", "pass_tds", ("rec_td_share",)),
-    Pool("passing_tds", "pass_tds", ("pass_td_share",)),
+    Pool("passing_tds", "pass_tds", ("pass_td_share",), queue=True),
     Pool("rushing_tds", "rush_tds", ("rush_td_share", "qb_rush_td_share")),
-    Pool("dropbacks", "dropbacks", ("dropback_share",)),
+    Pool("dropbacks", "dropbacks", ("dropback_share",), queue=True),
     # participation: several players share one snap, so these are not divided and not scaled
     Pool("offense_snaps", "plays", ("snap_share",), exclusive=False),
     Pool("routes", "dropbacks", ("route_participation",), exclusive=False),
@@ -160,6 +180,26 @@ def player_shares(
     return estimate.wide(detail, SHARE_METRICS)
 
 
+def _queue_alloc(claim: pl.Expr, want: pl.Expr) -> pl.Expr:
+    """Fill the depth chart in order and give each man only what the men ahead of him left.
+
+        alloc_i = min(claim_i, max(0, want - Sigma_(j<i) claim_j))
+
+    The alternative -- scaling everyone by the same factor -- is the defect this exists to fix. A
+    quarterback room is a queue, not a committee: the starter takes every dropback he is available for
+    and the backup takes the rest, so an over-claiming backup is *his own* error. Proportional scaling
+    spread it over the room and left the model contradicting itself, projecting a starter 15.6 games
+    and then 73% of his team's dropbacks.
+
+    A zero claim consumes nothing and receives nothing, so the players who are not in this pool at all
+    sit in the ordering harmlessly. If the room *under*-claims the caller's proportional scale-up still
+    runs afterwards and lifts it to the target -- somebody has to throw the passes -- so the pool is
+    conserved either way.
+    """
+    ahead = claim.cum_sum().over(["game_id", "team"], order_by=["depth_slot", "player_id"]) - claim
+    return pl.min_horizontal(claim, (want - ahead).clip(lower_bound=0.0))
+
+
 def opportunity(
     season: int = PROJ_SEASON,
     settings: Settings | None = None,
@@ -169,12 +209,21 @@ def opportunity(
     rows: pl.DataFrame | None = None,
     pool_targets: dict[str, float] | None = None,
     env: pl.DataFrame | None = None,
+    on_grid: Callable[[pl.DataFrame], pl.DataFrame] | None = None,
 ) -> pl.DataFrame:
     """One row per player per game: how many of each thing he is projected to get.
 
     `p_play` is his availability, from `roster.participation`, and it multiplies the share *before*
     the pool is divided. A pool's scale factor is therefore the honest answer to "do the people I
     expect on the field this week add up to a whole offence?".
+
+    `on_grid` is handed the player-game frame after the shares and the team's numbers have been joined
+    onto it and *before* any pool is divided. That is the seam a per-game edit belongs at: the override
+    layer uses it to say "he is out in week 5" or "he runs the routes this week", and because the
+    division has not happened yet, the pool still comes out whole -- the room absorbs what he is not
+    taking, the quarterback queue promotes the backup for that week only, and the counts are re-derived
+    rather than typed over. Applied after the division, the same edit would leave a team's targets not
+    adding up to the targets it is projected to throw.
     """
     settings = settings or Settings()
     part = roster.participation(season, settings, fitted=fitted) if part is None else part
@@ -188,6 +237,8 @@ def opportunity(
     grid = ros.join(shares.select("player_id", *have), on="player_id", how="left").join(
         games, on=["season", "team"], how="inner"
     )
+    if on_grid is not None:
+        grid = on_grid(grid)
     targets = measure_targets() if pool_targets is None else pool_targets
 
     scaled = []
@@ -196,27 +247,35 @@ def opportunity(
         team_col = f"team_{pool.team_col}"
         if not parts or team_col not in grid.columns:
             continue
+        raw_col, sum_col = f"raw_{pool.name}", f"sum_{pool.name}"
         raw = pl.sum_horizontal([pl.col(s).fill_null(0.0) for s in parts]) * pl.col("p_play")
-        g = grid.with_columns(raw.alias(f"raw_{pool.name}"))
-        g = g.with_columns(
-            pl.col(f"raw_{pool.name}").sum().over(["game_id", "team"]).alias(f"sum_{pool.name}")
-        )
+        g = grid.with_columns(raw.alias(raw_col))
         want = pl.lit(targets.get(pool.name, 1.0))
+        normalize = settings.normalize_pools and pool.exclusive
+        # a queue reallocates within the room before anything is scaled, so the scale factor below
+        # sees the claims as the depth chart leaves them
+        if normalize and pool.queue:
+            g = g.with_columns(_queue_alloc(pl.col(raw_col), want).alias(raw_col))
+        g = g.with_columns(pl.col(raw_col).sum().over(["game_id", "team"]).alias(sum_col))
         # a pool nobody claims is left alone rather than divided by zero
         factor = (
-            pl.when(pl.col(f"sum_{pool.name}") > 1e-9)
-            .then(want / pl.col(f"sum_{pool.name}"))
+            pl.when(pl.col(sum_col) > 1e-9)
+            .then(want / pl.col(sum_col))
             .otherwise(pl.lit(1.0))
         )
-        use = factor if (settings.normalize_pools and pool.exclusive) else pl.lit(1.0)
+        use = factor if normalize else pl.lit(1.0)
         scaled.append(
             g.select(
                 "game_id", "player_id",
-                (pl.col(f"raw_{pool.name}") * use).alias(f"share_{pool.name}"),
-                (pl.col(f"raw_{pool.name}") * use * pl.col(team_col)).alias(pool.name),
+                (pl.col(raw_col) * use).alias(f"share_{pool.name}"),
+                (pl.col(raw_col) * use * pl.col(team_col)).alias(pool.name),
             )
         )
-    out = grid.drop([c for c in SHARE_METRICS if c in grid.columns])
+    # the shares are kept rather than dropped: they are the *input* to every count on the row, and a
+    # per-game edit lands on them, so a reader -- or an editing grid -- can see the number that was
+    # divided beside what it produced. They are named nothing like the counts (`target_share` against
+    # `targets` and `share_targets`), so nothing downstream can confuse the three.
+    out = grid
     for frame in scaled:
         out = out.join(frame, on=["game_id", "player_id"], how="left")
     return out.sort(["team", "week", "position", "depth_slot"])
@@ -250,6 +309,7 @@ def pool_audit(
             "after_max": float(per_team["after"].max()),
             "count_per_game": float(per_team["count"].mean()),
             "normalized": bool(settings.normalize_pools and pool.exclusive),
+            "queued": bool(pool.queue),
         })
     return pl.DataFrame(rows)
 
@@ -282,6 +342,10 @@ def team_pool_sums(
     normalization off. It is the same quantity: a share and an availability are both season-level, so
     a pool's raw sum is identical in all 17 games, which is why `opportunity` can take the factor from
     any one of them.
+
+    `factor` is the proportional correction the raw sum implies. For a `queued` pool that is the size
+    of the disagreement but not what is done about it: the room is filled in depth order instead, so
+    the whole correction lands on the last men in the queue rather than on every claimant.
     """
     settings = settings or Settings()
     part = roster.participation(season, settings, fitted=fitted) if part is None else part
@@ -306,6 +370,7 @@ def team_pool_sums(
                 pl.lit(pool.exclusive).alias("exclusive"),
                 pl.lit(want).alias("measured_target"),
                 pl.lit(settings.normalize_pools and pool.exclusive).alias("normalized"),
+                pl.lit(pool.queue).alias("queued"),
             )
         )
     out = pl.concat(frames, how="vertical")
@@ -315,7 +380,7 @@ def team_pool_sums(
         (100.0 * (pl.col("raw_sum") - pl.col("measured_target"))
          / pl.col("measured_target")).alias("gap_pct"),
     ).select("team", "pool", "exclusive", "measured_target", "raw_sum", "factor", "gap_pct",
-             "normalized").sort(["team", "pool"])
+             "normalized", "queued").sort(["team", "pool"])
 
 
 def pool_report(
@@ -333,7 +398,7 @@ def pool_report(
     return (
         raw.select("pool", "team_col", "exclusive", "measured_target",
                    "raw_mean", "raw_min", "raw_max")
-        .join(after.select("pool", "after_mean", "count_per_game", "normalized"), on="pool")
+        .join(after.select("pool", "after_mean", "count_per_game", "normalized", "queued"), on="pool")
         .with_columns(
             (100.0 * (pl.col("raw_mean") - pl.col("measured_target"))
              / pl.col("measured_target")).alias("gap_pct")
@@ -353,6 +418,22 @@ def _report(season: int, settings: Settings) -> None:
         pl.col("after_mean").round(3), pl.col("count_per_game").round(2),
         pl.col("gap_pct").round(1),
     ))
+
+    print("\nQUARTERBACK ROOMS  season shares of the dropback pool, by depth slot")
+    qb = (opp.filter(pl.col("position") == "QB")
+          .group_by(["team", "player", "depth_slot"])
+          .agg(pl.col("p_play").first(), pl.col("share_dropbacks").mean().alias("share"),
+               pl.col("dropbacks").sum().alias("dropbacks")))
+    print(qb.group_by("depth_slot").agg(
+        pl.len().alias("n"), pl.col("share").mean().round(3).alias("share_mean"),
+        pl.col("share").min().round(3).alias("share_min"),
+        pl.col("share").max().round(3).alias("share_max"),
+        pl.col("dropbacks").mean().round(0).alias("dropbacks"),
+    ).sort("depth_slot"))
+    print("\nlowest-projected starters")
+    print(qb.filter(pl.col("depth_slot") == 1).sort("share").head(8).select(
+        "team", "player", pl.col("p_play").round(3), pl.col("share").round(3),
+        pl.col("dropbacks").round(0)))
 
     print(f"\nOPPORTUNITY  {opp.height:,} player-games, {opp['player_id'].n_unique()} players")
     ex = opp.filter((pl.col("team") == "PHI") & (pl.col("week") == 1))

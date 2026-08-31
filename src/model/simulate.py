@@ -1232,8 +1232,14 @@ def coverage(sim: Sim, actual: pl.DataFrame, view: str = "all", min_projected: f
             inside = ((pit[m] >= lo) & (pit[m] <= hi)).mean()
             row[f"cover_{round((hi - lo) * 100)}"] = float(inside)
             row[f"want_{round((hi - lo) * 100)}"] = want
-        row["below"] = float((pit[m] <= 0.05).mean())
-        row["above"] = float((pit[m] >= 0.95).mean())
+        # the two tails are the complement of the widest band, strictly. `cover_90` is closed on both
+        # edges, so an outcome landing exactly on P5 was counted as covered *and* below, and the three
+        # shares summed to more than one -- by 2 points of a hundred at 120 draws. A simulated season is
+        # discrete in two places, so landing exactly on an edge is common rather than a curiosity, and a
+        # floor that contains the outcome is not a floor that was missed.
+        lo, hi, _ = COVER[0]
+        row["below"] = float((pit[m] < lo).mean())
+        row["above"] = float((pit[m] > hi).mean())
         row["median_bias"] = float(np.median(a[m] - j["p50"].to_numpy()[m]))
         rows.append(row)
     return pl.DataFrame(rows)

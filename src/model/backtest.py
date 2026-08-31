@@ -186,10 +186,13 @@ def ex_ante(season: int, settings: Settings) -> Ex:
     """Refit every per-season artifact from seasons strictly before `season`."""
     hist = lake.history_seasons(last=season - 1)
     fitted = priors.fitted_as_of(season, settings)
+    saved = roster.load_availability()
+    tau = saved.get("tau")
     fitted = replace(
         fitted,
-        slot_games=roster.slot_games_as_of(season),
-        games_k=roster.load_availability().get("k"),
+        slot_games=roster.slot_games_as_of(season, tau=tau),
+        games_k=saved.get("k"),
+        games_tau=tau,
     )
     when = "latest" if season >= PROJ_SEASON else "preseason"
     return Ex(

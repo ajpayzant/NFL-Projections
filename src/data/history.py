@@ -491,6 +491,74 @@ def defense_by_position(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
     )
 
 
+# --------------------------------------------------------------------------- #
+# the injury report
+# --------------------------------------------------------------------------- #
+# Availability is the one term in the engine that is *stated* rather than fitted: a status of PUP or
+# NON is turned into a multiplier by a table of assumptions. This is the record against which those
+# assumptions are read -- not to fit them, but so that "back in week 6" and "he misses about three"
+# are typed beside what this player has actually missed rather than beside nothing.
+#
+# It is a weekly report, so the grain is a player-week and the counts below are counts of *distinct
+# weeks*: a team files three practice reports a week, and counting rows would say a hamstring cost
+# somebody fifty-one games.
+PRACTICE = {"Did Not": "DNP", "Limited": "limited", "Full": "full"}
+
+
+@lru_cache(maxsize=8)
+def injury_weeks(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
+    """One row per player-week on the league's injury report, regular season only.
+
+    `game_type` rather than `season_type` decides what is regular season: the latter is null on most
+    of the table, and a null read as REG would fold January into a seventeen-game season.
+    """
+    seasons = seasons or lake.history_seasons()
+    inj = lake.read("injuries", layer="raw", seasons=seasons)
+    keep = inj.filter(pl.col("game_type") == "REG")
+    practice = pl.col("practice_status").fill_null("")
+    return keep.select(
+        pl.col("gsis_id").alias("player_id"),
+        pl.col("full_name").alias("player"),
+        "season",
+        pl.col("week").cast(pl.Int32).alias("week"),
+        "team",
+        "position",
+        pl.col("report_status").alias("status"),
+        pl.coalesce("report_primary_injury", "practice_primary_injury").alias("injury"),
+        pl.when(practice.str.starts_with("Did Not")).then(pl.lit("DNP"))
+        .when(practice.str.starts_with("Limited")).then(pl.lit("limited"))
+        .when(practice.str.starts_with("Full")).then(pl.lit("full"))
+        .otherwise(None).alias("practice"),
+    )
+
+
+@lru_cache(maxsize=8)
+def injury_report(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
+    """One row per player-season: how much of it he spent on the report, and with what.
+
+    `weeks_out` is the number that matters -- a Friday designation of Out is the league telling you he
+    will not play, which is as close to observed missed time as a report gets. `weeks_questionable` is
+    much softer and is here to be read as noise beside it rather than added to it.
+    """
+    iw = injury_weeks(seasons)
+    if iw.is_empty():
+        return iw
+    weeks_where = lambda cond: pl.col("week").filter(cond).n_unique()  # noqa: E731
+    return iw.group_by(["player_id", "season"]).agg(
+        pl.col("player").drop_nulls().mode().first().alias("player"),
+        pl.col("team").drop_nulls().mode().first().alias("team"),
+        pl.col("position").drop_nulls().mode().first().alias("position"),
+        pl.col("week").n_unique().alias("weeks_listed"),
+        weeks_where(pl.col("status") == "Out").alias("weeks_out"),
+        weeks_where(pl.col("status") == "Doubtful").alias("weeks_doubtful"),
+        weeks_where(pl.col("status") == "Questionable").alias("weeks_questionable"),
+        weeks_where(pl.col("practice") == "DNP").alias("weeks_dnp"),
+        weeks_where(pl.col("practice") == "limited").alias("weeks_limited"),
+        pl.col("injury").drop_nulls().mode().first().alias("main_injury"),
+        pl.col("injury").n_unique().alias("distinct_injuries"),
+    ).sort(["player_id", "season"])
+
+
 def league_means(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
     """League average of each team-season metric -- the mean a team estimate regresses toward."""
     ts = team_seasons(seasons)
@@ -503,7 +571,7 @@ def league_means(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
 
 def clear_cache() -> None:
     for fn in (team_weeks, team_seasons, skill_weeks, skill_seasons, qb_weeks, qb_seasons,
-               defense_seasons, defense_by_position):
+               defense_seasons, defense_by_position, injury_weeks, injury_report):
         fn.cache_clear()
 
 
@@ -528,6 +596,12 @@ if __name__ == "__main__":
     print(qb.filter(pl.col("season") == last).sort("fantasy_points", descending=True).head(5)
           .select("player", "team", "games", "dropback_share", "attempt_rate", "scramble_rate",
                   "sack_rate", "designed_rush_share", "yards_per_attempt", "fantasy_points"))
+    print(f"\n-- {last} most time on the injury report, skill positions")
+    print(injury_report(seasons)
+          .filter((pl.col("season") == last) & pl.col("position").is_in(["QB", "RB", "WR", "TE"]))
+          .sort("weeks_out", descending=True).head(5)
+          .select("player", "position", "team", "weeks_listed", "weeks_out", "weeks_dnp",
+                  "main_injury"))
     print(f"\n-- {last} five stingiest defences vs WR (fantasy points allowed factor)")
     print(defense_by_position(seasons)
           .filter((pl.col("season") == last) & (pl.col("position") == "WR"))

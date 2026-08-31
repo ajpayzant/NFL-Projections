@@ -232,3 +232,76 @@ def test_team_pools_match_the_team_game_table(pools):
     assert (joined["team_targets"] - joined["targets"]).abs().max() <= 2
     assert (joined["team_carries"] - joined["carries"]).abs().max() <= 2
     assert (joined["team_games"] == joined["games"]).all()
+
+
+# --------------------------------------------------------------------------- #
+# the record, as opposed to the estimate of it
+# --------------------------------------------------------------------------- #
+# `estimate.season_history` is what the app puts beside an override knob: the same ratio the estimator
+# blends, but per season, unweighted and unshrunk. It is a different claim from `obs` and these check it
+# stays one -- a "record" that had quietly been recency-weighted would be indistinguishable on screen.
+HISTORY_METRICS = ("target_share", "yards_per_carry", "dropback_share")
+
+
+@pytest.fixture(scope="module")
+def record() -> pl.DataFrame:
+    from src.model import estimate
+
+    return estimate.season_history(HISTORY_METRICS, seasons=tuple(range(2021, 2026)))
+
+
+def test_the_record_is_one_row_per_player_season_per_metric_with_its_denominator(record):
+    assert set(record["metric"].unique().to_list()) == set(HISTORY_METRICS)
+    assert set(record["season"].unique().to_list()) <= set(range(2021, 2026))
+    assert record.height > 2000
+    assert record["n"].null_count() == 0
+    # a value is num / n wherever there was any opportunity at all
+    got = record.filter(pl.col("n") > 0)
+    assert (got["value"] - got["num"] / got["n"]).abs().max() == pytest.approx(0.0, abs=1e-12)
+    # and it is not weighted or clipped: shares reach the top of their range, rates exceed one
+    shares = record.filter(pl.col("kind") == "share")
+    assert shares["value"].max() > 0.9
+    assert record.filter(pl.col("metric") == "yards_per_carry")["value"].max() > 5.0
+
+
+def test_the_record_is_the_players_own_seasons_and_only_the_ones_asked_for(record):
+    from src.model import estimate
+
+    who = record.filter(pl.col("metric") == "target_share").group_by("player_id").len()
+    many = who.filter(pl.col("len") >= 3)["player_id"].to_list()[:5]
+    assert many, "expected somebody with three seasons of targets in five"
+    mine = estimate.season_history(("target_share",), tuple(many), seasons=(2024, 2025))
+    assert set(mine["player_id"].unique().to_list()) <= set(many)
+    assert set(mine["season"].unique().to_list()) <= {2024, 2025}
+
+
+def test_a_metric_nobody_has_heard_of_is_skipped_rather_than_raising():
+    from src.model import estimate
+
+    got = estimate.season_history(("not_a_metric",))
+    assert got.is_empty()
+    assert "value" in got.columns, "the empty frame keeps its schema so a page can select from it"
+
+
+def test_the_record_disagrees_with_the_recency_weighted_estimate_it_sits_beside(record):
+    """The whole reason both exist: a career average and a trend are different arguments.
+
+    If they agreed everywhere, one of them would be redundant. What is asserted is that the record
+    spans the estimate rather than reproducing it -- somebody's own seasons must straddle his `obs`.
+    """
+    from src.model import estimate, roster
+
+    ros = roster.roster(PROJ_SEASON)
+    own = estimate.own_rate(priors.BY_NAME["target_share"], PROJ_SEASON, Settings())
+    mine = (
+        record.filter(pl.col("metric") == "target_share")
+        .group_by("player_id").agg(pl.col("value").min().alias("lo"),
+                                   pl.col("value").max().alias("hi"), pl.len().alias("seasons"))
+        .filter(pl.col("seasons") >= 3)
+        .join(own, on="player_id", how="inner")
+        .join(ros.select("player_id"), on="player_id", how="inner")
+    )
+    assert mine.height > 100
+    inside = mine.filter((pl.col("obs") >= pl.col("lo") - 1e-9) & (pl.col("obs") <= pl.col("hi") + 1e-9))
+    assert inside.height == mine.height, "a weighted average must lie inside the seasons it averages"
+    assert mine.filter((pl.col("hi") - pl.col("lo")) > 0.05).height > 50, "no trends at all"

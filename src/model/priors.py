@@ -676,8 +676,8 @@ class Fitted:
     what happened in 2023. `fitted_as_of` rebuilds the frames from seasons strictly before a target
     so a held-out season can be projected the way it would have been projected at the time.
 
-    `slot_games` and `games_k` belong to `roster.py` and are filled by it; they travel here so that
-    one argument carries the whole fitted state rather than five.
+    `slot_games`, `games_k` and `games_tau` belong to `roster.py` and are filled by it; they travel
+    here so that one argument carries the whole fitted state rather than five.
 
     The four scalars -- `k`, `blends`, `games_k` and the team-level fits in `team.py` -- are *not*
     refitted per target season. They are two parameters per metric grid-searched over seven target
@@ -693,7 +693,8 @@ class Fitted:
     norms: pl.DataFrame
     blends: dict[str, tuple[str, float]]
     slot_games: pl.DataFrame = field(default_factory=pl.DataFrame)
-    games_k: float | None = None
+    games_k: float | dict[str, float] | None = None
+    games_tau: float | dict[str, float] | None = None
     as_of: int | None = None          # None means "the saved fit", i.e. everything on disk
 
     @property

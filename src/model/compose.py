@@ -186,17 +186,23 @@ def weekly(
     opp: pl.DataFrame | None = None,
     player_rates: pl.DataFrame | None = None,
     split_target: float | None = None,
+    adj: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """One row per player per game: counts, stats, fantasy points.
 
     `p_play` is already inside every count, so a row is an *expectation* for that week rather than a
     line conditional on playing. That is what makes the season a plain sum.
+
+    `adj` is the counts already joined to their rates -- what `efficiency.adjusted` returns. A caller
+    passes it when it has edited a rate for one game, since the edit has to land between the join and
+    the stat line and there is nowhere else to put it. Everything from there on is the same arithmetic.
     """
     settings = settings or Settings()
     opp = opportunity.opportunity(season, settings) if opp is None else opp
     if player_rates is None:
         player_rates = efficiency.rates(season, settings)
-    adj = efficiency.adjusted(opp, player_rates, settings)
+    if adj is None:
+        adj = efficiency.adjusted(opp, player_rates, settings)
 
     target = measure_dropback_split() if split_target is None else split_target
     out = adj.with_columns(_dropback_fates(target)).with_columns(_stat_line())

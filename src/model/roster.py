@@ -101,6 +101,31 @@ AVAIL_SLOT_CAP = 12
 # player's own attendance record weighs the same as his slot's average.
 GAMES_K_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 15.0, 1e9)
 
+# Which quantile of a slot's attendance record the prior aims at. The mean is the wrong target here
+# and it is worth being explicit about why: attendance is hard left-tailed -- a starting quarterback
+# either plays every week or misses a block of them -- so the mean of a slot sits well below its
+# median and prices a torn ACL into every healthy player. The metric this fit is scored on is MAE,
+# which is minimised by the conditional *median*, so a median-quantile prior is not a preference for
+# optimism, it is the internally consistent choice for the loss already in use. Fitted, not assumed.
+GAMES_TAU_GRID = (0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7)
+GAMES_TAU = 0.5
+
+# Both constants are fitted twice, because first-string jobs and bench jobs are not the same
+# population and one pair of constants has to compromise between them:
+#
+# - At slot 1-2 the job exists for certain (`presence` is 1.0), so attendance is *only* injury, and
+#   that distribution is hard left-tailed -- 17, 17, 17, 6. Its mean sits far below its median, which
+#   is why a mean-targeting prior projected a starting quarterback at thirteen games.
+# - At slot 5+ attendance is mostly whether he holds a job at all. No such skew, and lifting the
+#   prior there is not a harmless error: with proportional pool normalisation an over-projected
+#   backup takes his share off the starter in front of him.
+#
+# Four parameters on 4,806 held-out rows, and MAE is additive over the segments, so fitting them
+# apart *is* fitting them jointly -- it cannot score worse than one shared pair, and it measures
+# 3.697 against 3.702.
+AVAIL_FRONT_MAX = 2
+AVAIL_SEGMENTS = ("front", "back")
+
 AVAIL_PATH = FITTED / "availability.json"
 SLOT_GAMES_PATH = FITTED / "availability_slots.parquet"
 
@@ -135,6 +160,43 @@ def _games_by_team(seasons: tuple[int, ...]) -> pl.DataFrame:
         pl.concat(frames)
         .group_by(["season", "team", "player_id"])
         .agg(pl.col("games").max())     # a QB who also caught a pass appears in both frames
+    )
+
+
+def _by_segment(value: float | dict | None, default: float) -> dict[str, float]:
+    """One constant per availability segment, from a scalar, a mapping or nothing.
+
+    A scalar applies to both -- which is what `backtest`'s `own_games` ablation passes when it sets the
+    blend to zero, and what an artifact written before the split carries.
+    """
+    if isinstance(value, dict):
+        return {s: float(value.get(s, default)) for s in AVAIL_SEGMENTS}
+    v = default if value is None else float(value)
+    return dict.fromkeys(AVAIL_SEGMENTS, v)
+
+
+def _segment_expr(per_segment: dict[str, float]) -> pl.Expr:
+    """The segment's constant, per row, keyed off `avail_slot`."""
+    return (
+        pl.when(pl.col("avail_slot") <= AVAIL_FRONT_MAX)
+        .then(pl.lit(per_segment["front"], pl.Float64))
+        .otherwise(pl.lit(per_segment["back"], pl.Float64))
+    )
+
+
+@lru_cache(maxsize=8)
+def _team_games(seasons: tuple[int, ...]) -> pl.DataFrame:
+    """How many regular-season games each team actually played, per season.
+
+    Sixteen before 2021 and seventeen after, and that is not a detail: availability has to be a *rate*
+    before it can be pooled across a window that straddles the change. A prior built from raw counts
+    reads half of 2016-2020 as a player who missed a game, which biases every slot's prior low and
+    every projection with it. Measured rather than assumed, because a cancelled game is real too.
+    """
+    return (
+        history.team_weeks(seasons)
+        .group_by(["season", "team"])
+        .agg(pl.col("game_id").n_unique().cast(pl.Float64).alias("team_games"))
     )
 
 
@@ -250,16 +312,36 @@ def roster(season: int = PROJ_SEASON, when: str = "latest") -> pl.DataFrame:
 # availability: how many of the 17 does he play
 # --------------------------------------------------------------------------- #
 def _history_games(seasons: tuple[int, ...]) -> pl.DataFrame:
-    """Games played per player-season, summed across teams.
+    """Attendance per player-season as a rate of his team's games, summed across teams.
 
     Across teams because durability is a property of the player: a back who played nine games for one
     team and six for another was available for fifteen, and that is what predicts next season. The
     *target* the fit is scored against stays per team, because that is what a team's pool needs
     filling. Predicting availability and predicting where he does it are different questions.
+
+    `rate` is the number that travels between seasons; `games` is kept beside it so the report and the
+    app can print an attendance record in the units a reader thinks in.
     """
-    return _avail_panel(seasons).group_by(["season", "player_id"]).agg(
-        pl.min_horizontal(pl.col("games").sum(), pl.lit(float(REG_WEEKS - 1))).alias("games")
+    return (
+        _avail_panel(seasons)
+        .group_by(["season", "player_id"])
+        .agg(
+            pl.col("team_games").max().alias("team_games"),
+            pl.min_horizontal(pl.col("games").sum(), pl.col("team_games").max()).alias("games"),
+        )
+        .with_columns((pl.col("games") / pl.col("team_games")).clip(0.0, 1.0).alias("rate"))
     )
+
+
+def attendance_history(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
+    """The attendance record itself, per player-season: games, his team's games, and the rate.
+
+    The public form of what the fit reads, for the app to put beside the knob. `expected_games` is the
+    most argued-with number in the projection and the argument is only honest with the record in front
+    of it: four straight seventeens and two nines either side of a fifteen can shrink to the same
+    estimate, and only one of them is a player anybody should be talked out of.
+    """
+    return _history_games(tuple(seasons or lake.history_seasons()))
 
 
 @lru_cache(maxsize=4)
@@ -308,42 +390,76 @@ def _avail_panel(seasons: tuple[int, ...]) -> pl.DataFrame:
     panel = pl.concat(frames, how="diagonal_relaxed")
     return (
         panel.join(played, on=["season", "team", "player_id"], how="left")
+        .join(_team_games(seasons), on=["season", "team"], how="left")
         .with_columns(
             pl.col("games").fill_null(0.0),
+            pl.col("team_games").fill_null(float(REG_WEEKS - 1)),
             pl.min_horizontal("depth_slot", pl.lit(AVAIL_SLOT_CAP, pl.Int32)).alias("avail_slot"),
             pl.col("chart_tier").is_not_null().alias("charted"),
         )
+        .with_columns(
+            (pl.col("games") / pl.col("team_games")).clip(0.0, 1.0).alias("rate")
+        )
         .select("season", "team", "player_id", "position", "depth_slot", "avail_slot", "charted",
-                "games")
+                "games", "team_games", "rate")
     )
 
 
-def slot_games_prior(panel: pl.DataFrame, before: int) -> pl.DataFrame:
-    """Average games played by (position, slot), from seasons strictly before `before`.
+def slot_games_prior(
+    panel: pl.DataFrame, before: int, tau: float | dict[str, float] | None = None
+) -> pl.DataFrame:
+    """The `tau` quantile of the attendance *rate* by (position, slot), before `before`.
+
+    Two deliberate choices, both of which move a starter's projection materially:
+
+    - **A rate, not a count.** The window straddles the 2021 move from sixteen games to seventeen, so
+      a count pools two different denominators; see `_team_games`.
+    - **A quantile, not a mean.** Attendance is not symmetric. A first-string quarterback plays every
+      week or misses a block of them, and averaging the two produces a number no quarterback's season
+      ever looks like -- 13.1 games, which is neither the 17 of the majority nor the 6 of the injured.
+      Since the fit is scored on MAE, and MAE is minimised by the median, the median is the estimate
+      the loss actually asks for. `tau` is grid-searched in `fit_availability` all the same.
 
     Smoothed to be non-increasing in slot. Deeper means less playing time in aggregate; a bin that
     says otherwise is a handful of promoted backups, and pooling the offending neighbours removes it
-    without inventing a functional form.
+    without inventing a functional form. `prior_games` is `prior_rate` in seventeenths, carried for
+    readability only -- nothing downstream computes with it.
     """
+    taus = _by_segment(tau, GAMES_TAU)
     h = panel.filter(pl.col("season") < before)
     agg = (
         h.group_by(["position", "avail_slot"])
-        .agg(pl.col("games").mean().alias("raw_games"), pl.len().alias("n"))
+        .agg(
+            *[pl.col("rate").quantile(t, interpolation="linear").alias(f"q_{s}")
+              for s, t in taus.items()],
+            pl.col("rate").mean().alias("mean_rate"),
+            pl.len().alias("n"),
+        )
+        .with_columns(
+            pl.when(pl.col("avail_slot") <= AVAIL_FRONT_MAX)
+            .then(pl.col("q_front")).otherwise(pl.col("q_back")).alias("raw_rate"),
+            pl.when(pl.col("avail_slot") <= AVAIL_FRONT_MAX)
+            .then(pl.lit(taus["front"])).otherwise(pl.lit(taus["back"])).alias("tau"),
+        )
+        .drop([f"q_{s}" for s in taus])
         .sort(["position", "avail_slot"])
     )
     rows = []
     for pos in agg["position"].unique().sort():
         sub = agg.filter(pl.col("position") == pos)
-        smooth = priors._isotonic_decreasing(
-            sub["raw_games"].to_list(), [float(n) for n in sub["n"].to_list()]
-        )
-        for slot, raw, sm, n in zip(
-            sub["avail_slot"].to_list(), sub["raw_games"].to_list(), smooth, sub["n"].to_list(),
-            strict=True,
+        w = [float(n) for n in sub["n"].to_list()]
+        smooth = priors._isotonic_decreasing(sub["raw_rate"].to_list(), w)
+        # The mean is smoothed the same way, so `mae_mean_prior` compares the two targets and not
+        # one target against an unsmoothed version of the other.
+        means = priors._isotonic_decreasing(sub["mean_rate"].to_list(), w)
+        for slot, raw, t, mean, sm, n in zip(
+            sub["avail_slot"].to_list(), sub["raw_rate"].to_list(), sub["tau"].to_list(), means,
+            smooth, sub["n"].to_list(), strict=True,
         ):
             rows.append({
-                "position": pos, "avail_slot": int(slot), "raw_games": float(raw),
-                "prior_games": float(sm), "n": int(n),
+                "position": pos, "avail_slot": int(slot), "tau": float(t), "raw_rate": float(raw),
+                "mean_rate": float(mean), "prior_rate": float(sm),
+                "prior_games": float(sm) * float(REG_WEEKS - 1), "n": int(n),
             })
     return pl.DataFrame(rows)
 
@@ -382,9 +498,18 @@ def slot_presence(panel: pl.DataFrame, before: int) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
-def _join_slot_prior(df: pl.DataFrame, prior: pl.DataFrame) -> pl.DataFrame:
-    """Attach `prior_games` and `presence`, falling back to the deepest slot seen at that position."""
-    cols = [c for c in ("prior_games", "presence") if c in prior.columns]
+def _join_slot_prior(
+    df: pl.DataFrame,
+    prior: pl.DataFrame,
+    want: tuple[str, ...] = ("prior_rate", "presence"),
+) -> pl.DataFrame:
+    """Attach the slot's prior columns, falling back to the deepest slot seen at that position."""
+    if "prior_rate" not in prior.columns and "prior_games" in prior.columns:
+        # An artifact written before availability became a rate. Readable rather than fatal.
+        prior = prior.with_columns(
+            (pl.col("prior_games") / float(REG_WEEKS - 1)).alias("prior_rate")
+        )
+    cols = [c for c in want if c in prior.columns]
     deepest = (
         prior.sort(["position", "avail_slot"])
         .group_by("position")
@@ -414,59 +539,120 @@ def _own_games(hist: pl.DataFrame, target: int, settings: Settings) -> pl.DataFr
         pl.col("recency_weight") > 0
     )
     if h.is_empty():
-        return pl.DataFrame(schema={"player_id": pl.String, "obs_games": pl.Float64,
-                                    "n_seasons": pl.Float64, "seasons_seen": pl.UInt32})
+        return pl.DataFrame(schema={"player_id": pl.String, "obs_rate": pl.Float64,
+                                    "obs_games": pl.Float64, "n_seasons": pl.Float64,
+                                    "seasons_seen": pl.UInt32})
     return h.group_by("player_id").agg(
         (
-            (pl.col("games") * pl.col("recency_weight")).sum() / pl.col("recency_weight").sum()
-        ).alias("obs_games"),
+            (pl.col("rate") * pl.col("recency_weight")).sum() / pl.col("recency_weight").sum()
+        ).alias("obs_rate"),
         (pl.col("recency_weight").sum() / total).alias("n_seasons"),
         pl.col("season").n_unique().alias("seasons_seen"),
-    )
+    ).with_columns((pl.col("obs_rate") * float(REG_WEEKS - 1)).alias("obs_games"))
 
 
 def fit_availability(settings: Settings | None = None) -> dict:
-    """Grid-search the games blending constant on held-out seasons.
+    """Grid-search the slot prior's quantile and the blending constant, per segment, on held-out
+    seasons.
 
-    Scored in games, against the two things it blends: the player's own record alone (`k = 0`) and
-    his slot's average alone (`k = inf`). If neither endpoint is beaten there is no case for the
-    blend, and the report says so rather than burying it.
+    Scored in games -- so the number is readable and comparable across refits -- against the two
+    things the blend is made of: the player's own record alone (`k = 0`) and his slot's prior alone
+    (`k = inf`). If neither endpoint is beaten there is no case for the blend, and the report says so
+    rather than burying it. `mae_mean_prior` is the old mean-of-the-slot prior at the same `k`, kept as
+    a standing check that the quantile is earning its place rather than being assumed into the model.
+
+    `(tau, k)` is fitted separately for slots 1-2 and for everything behind them; see
+    `AVAIL_FRONT_MAX` for why. MAE is a mean of per-row absolute errors, so the segments are additive
+    and minimising each is minimising the whole -- the reported `mae` is the pooled number and is
+    directly comparable with a single-pair fit.
+
+    Everything is searched on the same held-out targets, which is why the prior is rebuilt inside the
+    target loop: a 2022 slot prior must not know 2024.
     """
     settings = settings or Settings()
     seasons = tuple(range(HISTORY_FROM, LAST_COMPLETE_SEASON + 1))
     panel = _avail_panel(seasons)
     hist = _history_games(seasons)
+    targets = [t for t in range(priors.FIT_FIRST_TARGET, LAST_COMPLETE_SEASON + 1)
+               if not panel.filter(pl.col("season") == t).is_empty()]
 
-    frames = []
-    for target in range(priors.FIT_FIRST_TARGET, LAST_COMPLETE_SEASON + 1):
-        cur = panel.filter(pl.col("season") == target)
-        if cur.is_empty():
-            continue
-        frames.append(
-            _join_slot_prior(cur, slot_games_prior(panel, before=target))
-            .join(_own_games(hist, target, settings), on="player_id", how="left")
-        )
-    scored = pl.concat(frames, how="diagonal_relaxed")
+    def build(tau: float) -> pl.DataFrame:
+        """The whole held-out panel with a prior built at one flat `tau`, for scoring one segment."""
+        frames = []
+        for target in targets:
+            cur = panel.filter(pl.col("season") == target)
+            frames.append(
+                _join_slot_prior(cur, slot_games_prior(panel, before=target, tau=tau),
+                                 want=("prior_rate", "mean_rate", "presence"))
+                .join(_own_games(hist, target, settings), on="player_id", how="left")
+            )
+        return pl.concat(frames, how="diagonal_relaxed")
 
-    def mae(k: float) -> float:
-        e = scored.select(
-            (shrink("obs_games", "prior_games", "n_seasons", k) - pl.col("games")).abs().alias("e")
+    built = {tau: build(tau) for tau in GAMES_TAU_GRID}
+
+    def part(scored: pl.DataFrame, segment: str) -> pl.DataFrame:
+        front = pl.col("avail_slot") <= AVAIL_FRONT_MAX
+        return scored.filter(front if segment == "front" else ~front)
+
+    def errs(scored: pl.DataFrame, k: float, prior_col: str = "prior_rate") -> pl.Series:
+        return scored.select(
+            (
+                shrink("obs_rate", prior_col, "n_seasons", k) * pl.col("team_games")
+                - pl.col("games")
+            ).abs().alias("e")
         )["e"]
-        return float(e.mean())
 
-    grid = [(k, mae(k)) for k in GAMES_K_GRID]
-    best_k, best = min(grid, key=lambda t: t[1])
-    own, prior_only = mae(0.0), mae(1e9)
-    return {
+    def mae(scored: pl.DataFrame, k: float, prior_col: str = "prior_rate") -> float:
+        return float(errs(scored, k, prior_col).mean())
+
+    out: dict = {
         "fitted_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "seasons": [priors.FIT_FIRST_TARGET, LAST_COMPLETE_SEASON],
-        "k": best_k if best_k < 1e8 else float("inf"),
+        "front_max_slot": AVAIL_FRONT_MAX,
+    }
+    k_by, tau_by, detail = {}, {}, {}
+    pooled_err, pooled_n = 0.0, 0
+    for segment in AVAIL_SEGMENTS:
+        grid = {(tau, k): mae(part(built[tau], segment), k)
+                for tau in GAMES_TAU_GRID for k in GAMES_K_GRID}
+        (tau, k), best = min(grid.items(), key=lambda kv: kv[1])
+        seg = part(built[tau], segment)
+        e = errs(seg, k)
+        pooled_err += float(e.sum())
+        pooled_n += int(e.len())
+        k_by[segment], tau_by[segment] = (k if k < 1e8 else float("inf")), tau
+        detail[segment] = {
+            "k": k_by[segment], "tau": tau, "mae": best, "n": int(seg.height),
+            "mae_own_record": mae(seg, 0.0), "mae_slot_prior": mae(seg, 1e9),
+            "mae_mean_prior": mae(seg, k, "mean_rate"),
+            "projected_games": float(seg.select(
+                (
+                    shrink("obs_rate", "prior_rate", "n_seasons", k) * pl.lit(float(REG_WEEKS - 1))
+                ).alias("g")
+            )["g"].mean()),
+            "actual_games": float(seg["games"].mean()),
+            "grid": {str(kk): grid[(tau, kk)] for kk in GAMES_K_GRID},
+            "tau_grid": {str(tt): grid[(tt, k)] for tt in GAMES_TAU_GRID},
+        }
+
+    whole = pl.concat([part(built[tau_by[s]], s) for s in AVAIL_SEGMENTS], how="diagonal_relaxed")
+    own = sum(float(errs(part(built[tau_by[s]], s), 0.0).sum()) for s in AVAIL_SEGMENTS) / pooled_n
+    prior_only = sum(
+        float(errs(part(built[tau_by[s]], s), 1e9).sum()) for s in AVAIL_SEGMENTS
+    ) / pooled_n
+    best = pooled_err / pooled_n
+    out |= {
+        "k": k_by, "tau": tau_by, "segments": detail,
         "mae": best, "mae_own_record": own, "mae_slot_prior": prior_only,
+        "mae_mean_prior": sum(
+            float(errs(part(built[tau_by[s]], s), k_by[s], "mean_rate").sum())
+            for s in AVAIL_SEGMENTS
+        ) / pooled_n,
         "gain_vs_own_pct": 100.0 * (own - best) / own if own else 0.0,
         "gain_vs_prior_pct": 100.0 * (prior_only - best) / prior_only if prior_only else 0.0,
-        "n": int(scored.height),
-        "grid": {str(k): m for k, m in grid},
+        "n": int(whole.height),
     }
+    return out
 
 
 def load_availability() -> dict:
@@ -478,14 +664,14 @@ def load_slot_games() -> pl.DataFrame:
     return pl.read_parquet(SLOT_GAMES_PATH) if SLOT_GAMES_PATH.is_file() else pl.DataFrame()
 
 
-def slot_games_as_of(before: int) -> pl.DataFrame:
-    """The depth-slot games prior and presence rate, from seasons strictly before `before`.
+def slot_games_as_of(before: int, tau: float | None = None) -> pl.DataFrame:
+    """The depth-slot attendance prior and presence rate, from seasons strictly before `before`.
 
     The saved parquet is the same thing fitted through the last complete season. This rebuilds it for
     a held-out target so that a 2022 twelfth receiver's survival odds are not informed by 2024.
     """
     panel = _avail_panel(tuple(range(HISTORY_FROM, before)))
-    return slot_games_prior(panel, before=before).join(
+    return slot_games_prior(panel, before=before, tau=tau).join(
         slot_presence(panel, before=before), on=["position", "avail_slot"], how="left"
     )
 
@@ -501,8 +687,12 @@ def availability(
     Three numbers, kept apart on purpose, because they answer three questions and only the first is
     fitted on a population that matches its use:
 
-    - `games_if_available` -- the blend of his own attendance record and his slot's average. This is
-      the fitted quantity, and it is *conditional on being in the season at all*.
+    - `games_if_available` -- the blend of his own attendance record and his slot's prior, both as a
+      rate of the team's games and then put back into seventeenths. This is the fitted quantity, and
+      it is *conditional on being in the season at all*. It is deliberately not discounted for an
+      injury that has not happened: the prior is the slot's median attendance, so a starter who has
+      played when healthy projects close to a full season, and the only things that mark him down are
+      a roster status that says he is hurt now and the range layer's own injury distribution.
     - `presence` -- how often a job that deep exists on an in-season roster. A 90-man August roster
       carries about 28.6 offensive players per team; the population that appears in a season is about
       21.9. Somebody has to be the difference, and depth slot is the only thing that says who.
@@ -513,37 +703,45 @@ def availability(
     """
     settings = settings or Settings()
     ros = roster(season) if ros is None else ros
-    k = fitted.games_k if fitted is not None and fitted.games_k is not None else \
-        load_availability().get("k")
-    k = settings.default_share_k if k is None else float(k)
+    saved = load_availability()
+    raw_k = fitted.games_k if fitted is not None and fitted.games_k is not None else saved.get("k")
+    k = _by_segment(raw_k, settings.default_share_k)
+    raw_tau = fitted.games_tau if fitted is not None and fitted.games_tau is not None else \
+        saved.get("tau")
+    tau = _by_segment(raw_tau, GAMES_TAU)
 
     prior = fitted.slot_games if fitted is not None else load_slot_games()
     if prior.is_empty():
         panel = _avail_panel(tuple(range(HISTORY_FROM, season)))
-        prior = slot_games_prior(panel, before=season).join(
+        prior = slot_games_prior(panel, before=season, tau=tau).join(
             slot_presence(panel, before=season), on=["position", "avail_slot"], how="left"
         )
     hist = _history_games(tuple(range(HISTORY_FROM, season)))
 
+    games = float(REG_WEEKS - 1)
+    k_expr = _segment_expr(k)
     out = (
         _join_slot_prior(ros, prior)
         .join(_own_games(hist, season, settings), on="player_id", how="left")
         .with_columns(
-            shrink("obs_games", "prior_games", "n_seasons", k).alias("games_if_available"),
-            shrink_weight("n_seasons", k).alias("games_own_weight"),
+            shrink("obs_rate", "prior_rate", "n_seasons", k_expr).alias("available"),
+            shrink_weight("n_seasons", k_expr).alias("games_own_weight"),
         )
         .with_columns(
             pl.col("status")
             .replace_strict(settings.status_availability, default=1.0, return_dtype=pl.Float64)
-            .alias("status_factor")
+            .alias("status_factor"),
+            # Back into games, which is the unit every reader and every override thinks in.
+            (pl.col("available").clip(0.0, 1.0) * games).alias("games_if_available"),
+            (pl.col("prior_rate") * games).alias("prior_games"),
         )
     )
     return out.with_columns(
         pl.min_horizontal(
             pl.col("games_if_available") * pl.col("presence") * pl.col("status_factor"),
-            pl.lit(float(REG_WEEKS - 1)),
+            pl.lit(games),
         ).clip(lower_bound=0.0).alias("expected_games")
-    ).with_columns((pl.col("expected_games") / float(REG_WEEKS - 1)).alias("active_weeks"))
+    ).with_columns((pl.col("expected_games") / games).alias("active_weeks"))
 
 
 # --------------------------------------------------------------------------- #
@@ -664,7 +862,7 @@ def fit_all(settings: Settings | None = None) -> dict:
 
     fit = fit_availability(settings)
     panel = _avail_panel(seasons)
-    slot_prior = slot_games_prior(panel, before=PROJ_SEASON).join(
+    slot_prior = slot_games_prior(panel, before=PROJ_SEASON, tau=fit["tau"]).join(
         slot_presence(panel, before=PROJ_SEASON), on=["position", "avail_slot"], how="left"
     )
 
@@ -688,6 +886,7 @@ def fit_all(settings: Settings | None = None) -> dict:
 def clear_cache() -> None:
     roster.cache_clear()
     _games_by_team.cache_clear()
+    _team_games.cache_clear()
     _draft.cache_clear()
     load_slot_games.cache_clear()
 
@@ -716,10 +915,24 @@ def _report(art: dict) -> None:
         ).sort("len", descending=True))
 
     print("\nAVAILABILITY  expected games, blend of own record and depth slot  (MAE in games)")
+    seg = fit.get("segments") or {}
+    print(pl.DataFrame([
+        {
+            "segment": name if name != "front" else f"front (slots 1-{fit.get('front_max_slot', 2)})",
+            "slot_tau": d["tau"], "k_seasons": d["k"], "mae": round(d["mae"], 3),
+            "mae_own_record": round(d["mae_own_record"], 3),
+            "mae_slot_prior": round(d["mae_slot_prior"], 3),
+            "mae_mean_prior": round(d["mae_mean_prior"], 3),
+            "proj_games": round(d["projected_games"], 2),
+            "actual_games": round(d["actual_games"], 2), "n": d["n"],
+        }
+        for name, d in seg.items()
+    ] or [{"segment": "pooled", "mae": round(fit["mae"], 3)}]))
     print(pl.DataFrame([{
-        "k_seasons": fit["k"], "mae": round(fit["mae"], 3),
+        "pooled_mae": round(fit["mae"], 3),
         "mae_own_record": round(fit["mae_own_record"], 3),
         "mae_slot_prior": round(fit["mae_slot_prior"], 3),
+        "mae_mean_prior": round(fit["mae_mean_prior"], 3) if "mae_mean_prior" in fit else None,
         "gain_vs_own_%": round(fit["gain_vs_own_pct"], 1),
         "gain_vs_prior_%": round(fit["gain_vs_prior_pct"], 1),
         "n": fit["n"],
@@ -730,6 +943,17 @@ def _report(art: dict) -> None:
           .join(sp.pivot(on="position", index="avail_slot", values="presence"),
                 on="avail_slot", suffix="_present")
           .sort("avail_slot").select(pl.all().round(2)))
+
+    # The one number a reader checks this module against: a first-string player's projected season.
+    print("\nSTARTERS  what slot 1 is projected to play, by position")
+    print(part.filter(pl.col("depth_slot") == 1).group_by("position").agg(
+        pl.len().alias("n"),
+        pl.col("obs_games").mean().round(2).alias("own_record"),
+        pl.col("games_if_available").mean().round(2).alias("if_available"),
+        pl.col("expected_games").mean().round(2).alias("expected"),
+        pl.col("expected_games").min().round(1).alias("lowest"),
+        (pl.col("expected_games") >= 16.0).mean().round(2).alias("share_16_plus"),
+    ).sort("position"))
 
     blend = art.get("rookie_blend") or {}
     rook = [{"metric": m, "form": blend[m][0], "w": blend[m][1]}

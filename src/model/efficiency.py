@@ -111,16 +111,26 @@ def context_factors(frame: pl.DataFrame, settings: Settings | None = None) -> pl
     return frame.with_columns(exprs)
 
 
+def use_rates(frame: pl.DataFrame) -> pl.DataFrame:
+    """`used_<rate>` = the player's rate times this game's factor, for every rate on the frame.
+
+    Split out of `adjusted` so that it can be run again. The override layer edits a rate for one game
+    on the joined frame, and what the composition reads has to follow that edit rather than stay the
+    product that was computed when the join happened.
+    """
+    return frame.with_columns([
+        (pl.col(c) * pl.col(f"f_{c}")).alias(f"used_{c}")
+        for c in RATE_METRICS if c in frame.columns and f"f_{c}" in frame.columns
+    ])
+
+
 def adjusted(frame: pl.DataFrame, player_rates: pl.DataFrame,
              settings: Settings | None = None) -> pl.DataFrame:
     """Join a player's rates onto his games and apply the game factor. `used_<rate>` is the answer."""
     have = [c for c in RATE_METRICS if c in player_rates.columns]
-    out = context_factors(
+    return use_rates(context_factors(
         frame.join(player_rates.select("player_id", *have), on="player_id", how="left"), settings
-    )
-    return out.with_columns(
-        [(pl.col(c) * pl.col(f"f_{c}")).alias(f"used_{c}") for c in have]
-    )
+    ))
 
 
 def _report(season: int, settings: Settings) -> None:

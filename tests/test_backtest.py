@@ -251,7 +251,9 @@ def test_the_interval_report_scores_the_range_and_not_the_point() -> None:
         assert every["want_90"] == 0.9
         assert 0.5 < every["cover_90"] <= 1.0
         assert every["cover_50"] < every["cover_90"]
-        assert every["below"] + every["cover_90"] + every["above"] == pytest.approx(1.0, abs=0.02)
+        # a partition, not an approximation: the two tails are the complement of the band, so an
+        # outcome exactly on P5 belongs to one of the three and not to two of them
+        assert every["below"] + every["cover_90"] + every["above"] == pytest.approx(1.0, abs=1e-9)
 
 
 # --------------------------------------------------------------------------- #

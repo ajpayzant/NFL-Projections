@@ -18,6 +18,10 @@ priced off draft capital by whichever of the fitted forms won out of sample.
 come back, because a user about to override a number needs to know whether it rests on nine hundred
 routes or on nine. That is the same discipline as the workbook's BASE / Adj / USED triplet, which is
 the one thing about it that worked.
+
+`season_history` is the other half of the same idea: the record season by season rather than the one
+number the blend reads. A career average is what an estimator should use and a trend is what a person
+should argue with, so both are available and neither is derived from the other in the app.
 """
 
 from __future__ import annotations
@@ -148,6 +152,61 @@ def estimate(
     if not frames:
         return pl.DataFrame()
     return pl.concat(frames, how="diagonal_relaxed").sort(["team", "position", "depth_slot", "metric"])
+
+
+_HISTORY_SCHEMA = {"season": pl.Int32, "player_id": pl.String, "player": pl.String,
+                   "team": pl.String, "games": pl.Int64, "metric": pl.String, "kind": pl.String,
+                   "units": pl.String, "num": pl.Float64, "n": pl.Float64, "value": pl.Float64}
+
+
+def season_history(
+    names: tuple[str, ...] | list[str],
+    player_ids: tuple[str, ...] | list[str] | None = None,
+    seasons: tuple[int, ...] | None = None,
+) -> pl.DataFrame:
+    """What a player's own metric actually measured, season by season, unweighted and unshrunk.
+
+    `estimate` returns `obs`: one recency-weighted number over a career, which is the right input to a
+    blend and the wrong thing to argue with. A rookie year at 9% followed by four seasons at 26% and
+    five flat seasons at 22% can produce the same `obs`, and only one of those is a player whose role
+    has changed. So the same ratio is returned here per season, with its denominator beside it, and
+    nothing is weighted, blended or clipped: this is the record, not an estimate of it.
+
+    Both are needed for the same decision, which is why they are separate functions rather than one
+    frame -- an override is argued from the record and applied against the estimate.
+    """
+    frames = []
+    for name in names:
+        metric = priors.BY_NAME.get(name)
+        if metric is None:
+            continue
+        hist = priors._hist(metric.table)
+        if metric.num not in hist.columns or metric.den not in hist.columns:
+            continue
+        d = hist.filter(pl.col("season") >= metric.since)
+        if seasons:
+            d = d.filter(pl.col("season").is_in(list(seasons)))
+        if player_ids is not None:
+            d = d.filter(pl.col("player_id").is_in(list(player_ids)))
+        if d.is_empty():
+            continue
+        frames.append(d.select(
+            pl.col("season").cast(pl.Int32),
+            "player_id",
+            pl.col("player").cast(pl.String) if "player" in d.columns
+            else pl.lit(None, pl.String).alias("player"),
+            pl.col("team").cast(pl.String),
+            pl.col("games").cast(pl.Int64),
+            pl.lit(name).alias("metric"),
+            pl.lit(metric.kind).alias("kind"),
+            pl.lit(metric.den).alias("units"),
+            pl.col(metric.num).cast(pl.Float64).alias("num"),
+            pl.col(metric.den).cast(pl.Float64).alias("n"),
+            ratio(metric.num, metric.den, "value"),
+        ))
+    if not frames:
+        return pl.DataFrame(schema=_HISTORY_SCHEMA)
+    return pl.concat(frames, how="diagonal_relaxed").sort(["metric", "player_id", "season"])
 
 
 def wide(detail: pl.DataFrame, names: tuple[str, ...] | None = None) -> pl.DataFrame:
