@@ -7,6 +7,7 @@ streamlit>=1.40
 pandas>=2.2              # only for st.dataframe's column_config path
 xlsxwriter>=3.2          # the formatted multi-sheet export
 requests>=2.32           # the nflverse refresh
+nflreadpy>=0.1.5         # ditto: rosters, depth charts, schedules, injuries, draft picks
 
 # Optional. Google Sheets export degrades to "configure credentials" without these; every other
 # destination works.

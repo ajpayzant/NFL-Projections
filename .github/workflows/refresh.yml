@@ -1,0 +1,73 @@
+# A canary on the data this projection stands on, not the update itself.
+#
+# The update that matters runs on the machine the app runs on -- scripts/update_data.py, on the two
+# Windows scheduled tasks that scripts\install_schedule.ps1 registers -- because the app is local, the
+# lake it reads is local, and a runner cannot reach either. What a runner *can* do is fetch the four
+# light tables every morning and tell us the moment upstream changes under us: nflreadpy renames a
+# column, a season stops being served, a dataset comes back empty on a Tuesday in October. That is a
+# failure worth an email before it is a projection built on a stale snapshot.
+#
+# Deliberately does not commit anything. A roster snapshot in git is a file that looks authoritative
+# and is wrong within a day, and `data/raw` is gitignored precisely so that cannot happen. The fetched
+# tables go up as an artifact instead: downloadable into `data/raw/` if the local refresh is ever the
+# thing that is broken.
+
+name: data refresh canary
+
+on:
+  schedule:
+    - cron: "30 11 * * *"      # 11:30 UTC daily -- after the nflverse nightly rebuilds have landed
+  workflow_dispatch:
+    inputs:
+      season:
+        description: Season to fetch
+        required: false
+        default: "2026"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Refresh rosters, depth charts, schedules, injuries, draft picks
+        id: refresh
+        # Exit 1 is "a non-essential table was missed", which is the normal preseason answer: nflreadpy
+        # refuses the projection season's injuries until the season starts. Exit 2 is an essential table
+        # missing (rosters, depth charts, schedules) and is the thing this job exists to shout about.
+        run: |
+          set +e
+          python -m src.data.refresh --seasons "${{ inputs.season || '2026' }}"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "refresh exited $code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ge 2 ]; then exit "$code"; fi
+          exit 0
+
+      - name: What landed
+        run: python -m src.data.refresh --check | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the fetch
+        uses: actions/upload-artifact@v4
+        with:
+          name: light-tables-${{ inputs.season || '2026' }}
+          path: data/raw/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Say so if a table was missed
+        if: steps.refresh.outputs.code != '0'
+        run: |
+          echo "::warning::refresh exited ${{ steps.refresh.outputs.code }} -- one of the light tables was not written. Before the season starts this is injuries and is expected."

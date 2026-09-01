@@ -27,10 +27,21 @@ python -m venv .venv
 .venv/Scripts/streamlit run app/Home.py                # serves on http://localhost:8611
 ```
 
-For day-to-day use start it from **`run_app.bat`** (double-click, or point a Desktop shortcut at it)
-rather than from a terminal you intend to close. A server started inside a shell — or inside an agent
-session — is a child of that shell and is killed when it ends, which the browser reports mid-edit as a
-"connection error" with nothing in the log. `run_app.bat` gives the process to the desktop instead.
+For day-to-day use start it from **`run_app.bat`** rather than from a terminal you intend to close. A
+server started inside a shell — or inside an agent session — is a child of that shell and is killed when
+it ends, which the browser reports mid-edit as a "connection error" with nothing in the log.
+`run_app.bat` gives the process to the desktop instead. Clicking it twice is safe: if 8611 is already
+serving, it opens the tab rather than starting a second server with a second set of caches.
+
+One click, from the desktop or the Start menu:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_shortcuts.ps1     # -Remove undoes it
+```
+
+That writes a Desktop shortcut and a Start Menu entry pointing at `run_app.bat`, both starting
+minimised. Pinning is the one step a script cannot do — right-click the Start Menu entry and choose
+**Pin to Start**, or drag the Desktop one to the taskbar.
 
 The app serves on **port 8611**, pinned in `.streamlit/config.toml`. Don't run it on Streamlit's
 default 8501 — the PLL Pricing Tool launcher probes that port, and an app sitting on it will hijack
@@ -58,6 +69,74 @@ committed: it is small, it is what the backtest scored, and a clone should proje
 **History → ⚖️ Share sums** reports the age of every table, and separately whether `processed/` has kept up
 with the week the season is actually in — the question an age in days cannot answer, since a table
 refreshed this morning can still be missing last Sunday's games.
+
+## Keeping it current as the season goes
+
+One command does the whole update, and it is safe to run any number of times:
+
+```bash
+scripts\weekly_update.bat            # light: rosters, depth charts, schedules, injuries. Seconds.
+scripts\weekly_update.bat --full     # light, after rebuilding the played-game lake. Minutes.
+python scripts/update_data.py --dry-run --full     # what it would run, without running it
+```
+
+Two speeds because the data has two: the light tables decide *who is on the field* and change every day,
+while the played-game tables only change after games are played. The heavy half is not reimplemented
+here — it is the engine repo's own `bootstrap_data → build_tables → build_aggregates` chain, which is
+season-scoped and idempotent, so re-running it for the projection season *is* the update. If that repo
+is not on this machine (or `NFLSP_ENGINE_DIR` points elsewhere) the heavy pass is skipped with a line in
+the log and the light pass still runs. Every run appends to `build/review/update.log`.
+
+On a clock, without anybody remembering:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_schedule.ps1     # -List, -Remove
+```
+
+Two Windows scheduled tasks under your own account, no elevation: the light pass daily at 06:30, the
+full one Wednesday at 04:00 (after Monday night has been processed upstream, before anybody wants
+Thursday's numbers). `StartWhenAvailable` is on, so a machine that was asleep runs the task when it
+wakes rather than skipping the day.
+
+Task Scheduler will report **Last Run Result: 1** for the daily task until week 1, and that is the
+honest code rather than a fault: 1 is "a non-essential table was missed", and nflreadpy refuses this
+season's injuries outright until the season starts. A miss on rosters, depth charts or schedules — the
+tables that decide who is projected at all — comes back as 2.
+
+**A running app does not notice.** The projection is `st.cache_data`, the cache is in the server
+process, and an update running in a different process cannot reach it — so an app that was open when
+the refresh landed keeps serving the frames it read at startup. `update_data.py` stamps
+`build/review/last_update.json`, the sidebar reads that stamp on every rerun, and if it is newer than
+the server it says so and asks for a restart. Close the window and click the shortcut again.
+
+### Your edits are not part of what gets replaced
+
+An override is a claim about a player — *he plays 12 games*, *his target share is 24%* — and it is keyed
+by player, not by a projected number, so it re-applies to whatever the data now says. Nothing in the
+update touches `data/scenarios/`.
+
+Every edit is written to disk as it is made, and a new session opens on the scenario the last one was
+using, so a closed tab or a restarted server costs nothing. What the sidebar adds is the copy that
+lives outside this machine: **⬇ Download this scenario** writes the whole thing as one JSON file, and
+**Upload a scenario file** takes it back — for a backup, another machine, or handing a set of edits to
+somebody else. It is the same JSON `data/scenarios/` holds, so a file from there can simply be dropped
+back in.
+
+### What GitHub Actions does, and does not
+
+- **`tests`** runs the suite on every push. A runner has no parquet lake, so `tests/conftest.py` turns
+  a test that reaches for it into a skip: 192 run, 200 skip. That still catches a broken import, a
+  renamed column, a page that stopped rendering — everything measured *against the lake* stays a local
+  gate, and so does `scripts/smoke_app.py`.
+- **`data refresh canary`** fetches the light tables every morning and fails loudly if an essential one
+  (rosters, depth charts, schedules) cannot be had — an upstream rename or a dataset gone empty is worth
+  knowing about before a projection is built on a stale snapshot. It uploads what it fetched as an
+  artifact and **commits nothing**: a roster snapshot in git looks authoritative and is wrong within a
+  day, which is why `data/raw/` is ignored in the first place.
+
+Actions cannot run the app or the update that matters: the app is local, the lake it reads is local, and
+one run takes the process to ~1.6 GB — past what a free hosted tier will give it. The scheduled tasks
+above are the real update; the workflows are a canary and a test gate.
 
 ## Is it any good
 
@@ -374,8 +453,12 @@ src/data/       lake reader, refresh, depth charts, history aggregates
 src/model/      priors, estimate, blend, team, roster, opportunity, efficiency,
                 compose, overrides, simulate, backtest
 src/export/     CSV, workbook and Google Sheets writers
-scripts/        smoke_app.py (every page in a real session), diag_dispersion.py
-tests/          pytest, including the leakage guards on the backtest
+scripts/        smoke_app.py (every page in a real session), update_data.py + weekly_update.bat
+                (the scheduled data update), install_shortcuts.ps1, install_schedule.ps1,
+                diag_dispersion.py
+tests/          pytest, including the leakage guards on the backtest; conftest.py skips what
+                needs the lake when there is no lake
+.github/        tests on every push, and a daily canary on the light tables
 ```
 
 ## Development
@@ -383,9 +466,12 @@ tests/          pytest, including the leakage guards on the backtest
 `main` is what runs; work happens on `develop`.
 
 ```bash
-python -m pytest -q            # ~300 tests, a few minutes: several fit real models
+python -m pytest -q            # 407 tests: several fit real models against the lake
 python scripts/smoke_app.py    # every page in a real Streamlit session, sixteen passes
 ```
+
+With no lake on the machine, 192 of those run and 200 skip (see `tests/conftest.py`) — which is what CI
+sees. Both numbers are the same suite; the local one is the gate.
 
 The smoke harness is the one that matters before a commit that touches the app: it runs each page with a
 genuine session, then with a scenario live, then clicks a reset and types a multiplier, then turns the

@@ -1,0 +1,44 @@
+# The suite, on every push. What CI can honestly check here is the half that does not need data.
+#
+# The parquet lake is another repo's 15 MB of played-game tables and is not in this one, so a runner
+# has no lake. tests/conftest.py turns that into skips instead of noise: 192 tests run and 200 skip.
+# That is enough to catch a broken import, a renamed column in a hand-built frame, a page that stopped
+# rendering, or an override rule that changed shape -- everything measured *against the lake* stays a
+# local gate, and `scripts/smoke_app.py` stays local for the same reason.
+#
+# No lint job: ruff is configured in pyproject.toml but is not a declared dependency, and a lint gate
+# nobody has run yet would be red for reasons that have nothing to do with the change that turned it on.
+
+name: tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"     # requires-python >= 3.13; local runs on 3.14
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Show what is being tested against
+        run: |
+          python -c "from src.config import LAKE, PROCESSED, PROJ_SEASON; print(f'season {PROJ_SEASON}'); print(f'lake {PROCESSED} exists={PROCESSED.is_dir()}')"
+
+      - name: pytest
+        # -rs lists the skips by reason, so "200 skipped" is readable rather than mysterious
+        run: python -m pytest -rs

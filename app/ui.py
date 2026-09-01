@@ -36,10 +36,12 @@ What is here is the three things a page does need:
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 
@@ -65,11 +67,13 @@ from src.model import compose, efficiency, opportunity, overrides, roster, simul
 from src.model.overrides import Override, Scenario  # noqa: E402
 
 SCORINGS = ("ppr", "half_ppr", "standard", "ppr_6td")
+UPDATE_STAMP = ROOT / "build" / "review" / "last_update.json"  # written by scripts/update_data.py
 HISTORY_VIEW = tuple(range(2021, LAST_COMPLETE_SEASON + 1))   # the seasons a player page shows
 LIVE = "scenario"                                             # the session-state key
 RESTORED = "scenario:restored_from"     # the saved name this session opened on, if it opened on one
 SAVED_AT = "scenario:saved_at"          # when autosave last wrote, so the sidebar can say so
 SAVE_ERROR = "scenario:save_error"      # why it could not, if it could not
+UPLOADED = "scenario:uploaded"           # the file_id of the last uploaded scenario, so it lands once
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +354,7 @@ def _scenario_panel(sc: Scenario) -> None:
             _state()[LIVE] = Scenario()
             _state().pop(RESTORED, None)
             st.rerun()
+        _transfer_panel(sc)
     try:
         st.page_link("pages/7_Edits.py", label="Every edit →")
     except Exception:                     # noqa: BLE001
@@ -357,6 +362,48 @@ def _scenario_panel(sc: Scenario) -> None:
         # what the smoke harness does -- means there is no page set to resolve against, and the link
         # is not worth failing a page over.
         st.caption("Edits")
+
+
+def _transfer_panel(sc: Scenario) -> None:
+    """A scenario as a file you hold, either direction.
+
+    Autosave already means no edit is lost to a closed tab, but everything it writes is under
+    `data/scenarios`, which is deliberately not in git -- so on this machine and nowhere else. A
+    downloaded scenario is the copy that survives a rebuilt laptop, goes in a backup, or is handed to
+    somebody else to open; an uploaded one is that in reverse. It is the same JSON `overrides.save`
+    writes, so a file from here can also simply be dropped into `data/scenarios`.
+
+    Overrides travel and projections do not, on purpose: an override is "this man plays 12 games", which
+    is still true against next week's numbers, while a projection is an answer to data that has since
+    moved. Opening a file re-runs it against whatever the lake now holds.
+    """
+    st.divider()
+    st.download_button(
+        "⬇ Download this scenario", data=sc.to_json(), mime="application/json",
+        file_name=f"{overrides.path(sc.name).stem}.json", width="stretch", key="scenario:download",
+        help="Every edit and league setting as one JSON file. Keep it as a backup, or open it on "
+             "another machine.")
+    got = st.file_uploader("Upload a scenario file", type="json", key="scenario:upload",
+                           help="A file downloaded from here. It becomes the live scenario and is "
+                                "saved under its own name, so nothing already on disk is overwritten "
+                                "unless it shares that name.")
+    if got is None:
+        return
+    # The uploader holds its file across reruns, so without a "seen this one" marker the first edit
+    # made after an upload would be immediately overwritten by the upload again, on the very next
+    # rerun. `file_id` is per selection, so re-choosing the same file deliberately still works.
+    seen = _state().get(UPLOADED)
+    if seen == getattr(got, "file_id", None):
+        return
+    try:
+        loaded = Scenario.from_json(got.getvalue().decode("utf-8"))
+    except Exception as exc:              # noqa: BLE001 -- any malformed file, named as such
+        st.error(f"not a scenario file: {type(exc).__name__}", icon="⚠️")
+        return
+    _state()[UPLOADED] = getattr(got, "file_id", None)
+    set_live(loaded)
+    _state()[RESTORED] = loaded.name
+    st.rerun()
 
 
 def scoring_label(name: str) -> str:
@@ -372,6 +419,41 @@ def _freshness_panel() -> None:
     st.caption(f"oldest table {oldest:.0f} days old" if oldest is not None else "no tables found")
     if not stale.is_empty():
         st.warning(f"missing {PROJ_SEASON}: {', '.join(stale['table'].to_list())}", icon="⚠️")
+    _update_panel()
+
+
+# When this process started, which is what makes a scheduled update visible or not: the projection is
+# `st.cache_data`, the cache is in memory, and `lake.clear_cache()` in a *different* process cannot
+# reach it. So a server that was up when the nightly refresh ran keeps serving yesterday's rosters
+# until it is restarted, silently, and the one thing worse than stale data is stale data that looks
+# current.
+_STARTED = datetime.now().astimezone()
+
+
+def last_update() -> dict:
+    """What `scripts/update_data.py` wrote when it last finished. Never cached: the point is to notice
+    a file that changed *after* the caches were filled."""
+    try:
+        return json.loads(UPDATE_STAMP.read_text(encoding="utf-8"))
+    except Exception:                     # noqa: BLE001 -- no stamp yet is the normal first-run case
+        return {}
+
+
+def _update_panel() -> None:
+    stamp = last_update()
+    when = str(stamp.get("finished") or "")
+    if not when:
+        return
+    try:
+        finished = datetime.fromisoformat(when)
+    except ValueError:
+        return
+    mode = "full rebuild" if stamp.get("mode") == "full" else "refresh"
+    if finished > _STARTED:
+        st.warning(f"data {mode} finished {_clock(when)}, after this server started — restart it to "
+                   "use the new numbers", icon="🔄")
+    else:
+        st.caption(f"last data {mode} {when[:10]} {_clock(when)}")
 
 
 # --------------------------------------------------------------------------- #

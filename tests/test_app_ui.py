@@ -919,3 +919,33 @@ def test_a_team_edit_and_a_week_edit_are_counted_as_what_they_are() -> None:
 def test_an_edit_on_a_player_nobody_has_is_not_counted_anywhere() -> None:
     got = _coverage((Override("player", "nobody", "target_share", "set", 0.3),))
     assert got["edits"].sum() == 0
+
+
+# --------------------------------------------------------------------------- #
+# the data under the projection, and whether the server has it
+# --------------------------------------------------------------------------- #
+# `st.cache_data` lives in the server process, so the nightly update -- a different process -- cannot
+# reach it: an app that was already open keeps serving the frames it read at startup. The sidebar says
+# so by comparing the stamp the update wrote against when this process began, and the one thing that
+# must not happen is a bad or absent stamp taking the sidebar down with it.
+def test_no_update_stamp_yet_is_not_an_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(ui, "UPDATE_STAMP", tmp_path / "never_written.json")
+    assert ui.last_update() == {}
+
+
+def test_an_unreadable_stamp_is_not_an_error(tmp_path, monkeypatch) -> None:
+    bad = tmp_path / "last_update.json"
+    bad.write_text("half a file", encoding="utf-8")
+    monkeypatch.setattr(ui, "UPDATE_STAMP", bad)
+    assert ui.last_update() == {}
+
+
+def test_the_stamp_is_read_fresh_every_time_rather_than_cached(tmp_path, monkeypatch) -> None:
+    """The whole point is noticing a file that changed *after* the caches were filled, so a cached
+    reader here would report exactly the staleness it exists to detect."""
+    stamp = tmp_path / "last_update.json"
+    monkeypatch.setattr(ui, "UPDATE_STAMP", stamp)
+    stamp.write_text('{"finished": "2026-09-02T06:30:01", "mode": "light"}', encoding="utf-8")
+    assert ui.last_update()["mode"] == "light"
+    stamp.write_text('{"finished": "2026-09-09T04:12:00", "mode": "full"}', encoding="utf-8")
+    assert ui.last_update()["mode"] == "full"
