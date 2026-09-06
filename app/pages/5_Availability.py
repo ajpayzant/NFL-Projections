@@ -265,15 +265,20 @@ with review_tab:
     # What decides who is on the list above, and the record an argument against it is made from. Both were
     # a tab of their own, which is the wrong shape for reference material: nobody opens it before making a
     # judgement, and it belongs under the judgement it explains.
+    # The assumption is editable here rather than displayed here, and that is the point of the section.
+    # Asserted numbers used to be read-only on the grounds that a stated assumption is not a knob, which
+    # left a reader who disagreed with one of them exactly one way to say so: type `expected_games = 0`
+    # on every man holding the status. Two numbers restate the assumption; two hundred edits restate it
+    # one player at a time and bury the argument in the override log.
     with st.expander("The stated assumptions — what each roster status is worth"):
         ui.note(
             "The factor each roster status is worth, and how many players it is currently deciding. This "
             "is the one place in the engine where a number is asserted rather than measured, so it is "
-            "shown with its population: a factor on a status nobody holds is a footnote."
+            "shown with its population: a factor on a status nobody holds is a footnote. Move one and "
+            "every player holding that status moves with it — which is the cheap way to say *the "
+            "practice squad does not play here*, instead of zeroing them one at a time."
         )
-        ui.table(ui.status_assumptions(view), digits=2, height=420,
-                 config={"availability": st.column_config.ProgressColumn(
-                     "assumed availability", min_value=0.0, max_value=1.0, format="%.2f")})
+        ui.status_editor(view, key="avail:status")
 
     with st.expander(f"The league's injury report, {ui.HISTORY_VIEW[0]}–{ui.LAST_COMPLETE_SEASON}"):
         ui.note(

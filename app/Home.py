@@ -86,6 +86,7 @@ with far:
         "Startable only", value=False,
         help=f"Inside the position's starter count: {view.settings.starters}",
     )
+    hide_gone = ui.roster_filter("board:gone")
 
 # now the filter is known, so the list can be the football first: one position's own box score, or every
 # position's line as a string
@@ -107,7 +108,7 @@ if sim is not None:
     FANTASY = FANTASY[:1] + ["median_rank", "ceiling_rank"] + FANTASY[1:-1] + RANGE + [FANTASY[-1]]
     LIST = LIST[:2] + ["median_rank"] + LIST[2:] + ["volatility"]
 
-shown = ui.apply_filters(board, positions, teams, search)
+shown = ui.apply_filters(board, positions, teams, search, hide_gone=hide_gone)
 if only_startable:
     shown = shown.filter(pl.col("startable"))
 if "line" in LIST:                      # only the rows on screen pay for the string
@@ -119,6 +120,9 @@ ui.tiles([
     {"name": "points on the board", "value": board["fantasy_points"].sum(), "digits": 0},
     {"name": "changed team", "value": (board.filter(pl.col("changed_team")).height
                                        if "changed_team" in board.columns else None), "digits": 0},
+    {"name": "released", "value": (board.filter(pl.col("status").is_in(list(ui.OFF_ROSTER))).height
+                                   if "status" in board.columns else None), "digits": 0,
+     "sub": "off the team, worth zero"},
     {"name": "carrying an override", "value": board.filter(pl.col("edited")).height, "digits": 0,
      "highlight": bool(board.filter(pl.col("edited")).height)},
 ])
@@ -303,7 +307,7 @@ with tiers_tab:
     ui.section("Tiers", f"Blocks of {view.settings.tier_size} within a position, in projected order. "
                         "Two players in the same tier are the same pick.")
     tiers = (
-        ui.apply_filters(board, positions, teams, "")
+        ui.apply_filters(board, positions, teams, "", hide_gone=hide_gone)
         .filter(pl.col("tier") <= 8)
         .group_by(["position", "tier"]).agg(
             pl.len().alias("n"),

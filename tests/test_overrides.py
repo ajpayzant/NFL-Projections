@@ -157,7 +157,37 @@ def test_the_league_patch_reaches_settings_and_nothing_else_does() -> None:
     assert st.scoring.reception == 0.5
     assert overrides.settings_for(Scenario()) == Settings()
     with pytest.raises(ValueError, match="not league-editable"):
-        Scenario().patch_league(status_availability={})
+        Scenario().patch_league(simulation_draws=10)
+
+
+def test_a_status_factor_is_patched_into_the_stated_set_and_not_over_it() -> None:
+    """The knob that replaces two hundred hand edits, and the merge that stops it costing nine others.
+
+    A scenario that disagrees about the practice squad should record the practice squad and nothing
+    else: stored whole, patching `DEV` would drop `CUT` and `RET` from the dict, and `availability`
+    would hand both of them its `default=1.0` fallback -- so saying "the practice squad does not play
+    here" would also have said "released players do", which is the opposite of the intent and would
+    have shown up as a hundred and fifty cut men back on the board with a full season each.
+    """
+    base = Settings().status_availability
+    sc = Scenario().patch_league(status_availability={"DEV": 0.0})
+    # recorded as the one disagreement, so the scenario reads as one disagreement
+    assert sc.league["status_availability"] == {"DEV": 0.0}
+    got = overrides.settings_for(sc).status_availability
+    assert got["DEV"] == 0.0
+    assert {k: v for k, v in got.items() if k != "DEV"} == {k: v for k, v in base.items()
+                                                            if k != "DEV"}
+    # a second disagreement joins the first rather than replacing it
+    both = sc.patch_league(status_availability={**sc.league["status_availability"], "RES": 0.0})
+    assert overrides.settings_for(both).status_availability["DEV"] == 0.0
+    assert overrides.settings_for(both).status_availability["RES"] == 0.0
+    # set back to what it always was, it is not an edit -- the baseline has to stay the baseline
+    assert sc.patch_league(status_availability=dict(base)).is_baseline
+    # and it survives the JSON round trip a saved scenario is
+    again = Scenario.from_json(both.to_json())
+    assert overrides.settings_for(again).status_availability == \
+        overrides.settings_for(both).status_availability
+    assert again.digest == both.digest
 
 
 def test_k_scale_moves_every_shrinkage_constant_and_leaves_one_untouched_alone() -> None:

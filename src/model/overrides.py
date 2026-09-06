@@ -77,11 +77,20 @@ WORKING = "working"
 
 MODES = ("set", "multiply")
 
-# Settings fields a scenario is allowed to patch. Not every field: `status_availability` is a stated
-# assumption rather than a knob, and `simulation_draws` belongs to the simulation.
+# Settings fields a scenario is allowed to patch. Not every field: `simulation_draws` belongs to the
+# simulation rather than to the league.
+#
+# `status_availability` was held out of this list as "a stated assumption rather than a knob", and that
+# was the wrong call for the one reason that matters -- it left a user no way to state the assumption
+# they actually hold. The practice squad is worth 1.0 by default and injured reserve 0.30, and a reader
+# who disagrees had exactly one way to say so: type `expected_games = 0` on every man. In this scenario
+# that is 134 practice-squad players and 66 on injured reserve hand-zeroed one at a time, 200 edits
+# saying twice what two numbers here say once. An assumption nobody can restate is not more honest than
+# a knob; it is the same assumption with the argument moved into the override log.
 LEAGUE_FIELDS = ("normalize_pools", "pool_tilt", "lock_edited_shares", "use_context_factors",
                  "market_weight", "schedule_renormalise", "context_k", "team_weight_recent",
-                 "team_keep_vs_mean", "games_projected", "tier_size", "recency")
+                 "team_keep_vs_mean", "games_projected", "tier_size", "recency",
+                 "status_availability")
 
 # Per-game team numbers worth editing: the pools the players divide, and the rates their efficiency
 # is scaled by. Deliberately not every column in the environment -- editing `points` alone would move
@@ -166,9 +175,19 @@ def league_defaults() -> dict[str, Any]:
 
 
 def _typed(value: Any, default: Any) -> Any:
-    """A JSON round-trip turns `recency`'s tuple into a list. Put it back before comparing or using it."""
+    """The stored value as the type `Settings` wants it, merged into the default where it is a mapping.
+
+    A JSON round-trip turns `recency`'s tuple into a list, so that goes back to a tuple before being
+    compared or used. `status_availability` is the other shape: a dict, and a *partial* one, because a
+    scenario that only disagrees about the practice squad should record only the practice squad. Merged
+    rather than replaced, or patching one status would silently drop the other nine and hand every
+    unlisted status the `default=1.0` fallback in `availability` -- a scenario saying "the practice
+    squad is worth nothing" would also have said "so is nobody who retired".
+    """
     if isinstance(default, tuple) and isinstance(value, list):
         return tuple(value)
+    if isinstance(default, dict) and isinstance(value, dict):
+        return {**default, **value}
     return value
 
 
@@ -178,10 +197,23 @@ def clean_league(values: dict[str, Any]) -> dict[str, Any]:
     A scenario that records `normalize_pools = True` is not the baseline any more -- different digest,
     different cache entry, an "edited" badge in the sidebar -- even though it means nothing. So a knob
     set back to its default is dropped rather than stored, and the baseline stays the baseline.
+
+    A mapping knob is pruned entry by entry for the same reason: `status_availability` has ten statuses
+    in it and a scenario that disagrees about one of them should read as one disagreement.
     """
     d = league_defaults()
-    return {k: _typed(v, d[k]) for k, v in values.items()
-            if k in d and _typed(v, d[k]) != d[k]}
+    out: dict[str, Any] = {}
+    for k, v in values.items():
+        if k not in d:
+            continue
+        if isinstance(d[k], dict) and isinstance(v, dict):
+            differs = {kk: vv for kk, vv in v.items() if kk not in d[k] or vv != d[k][kk]}
+            if differs:
+                out[k] = differs
+            continue
+        if _typed(v, d[k]) != d[k]:
+            out[k] = _typed(v, d[k])
+    return out
 
 
 # --------------------------------------------------------------------------- #

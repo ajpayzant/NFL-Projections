@@ -263,18 +263,34 @@ def _opt(columns: Container[str], name: str, dtype: pl.DataType = pl.String) -> 
     return pl.col(name) if name in columns else pl.lit(None, dtype).alias(name)
 
 
-def _week1_rows(season: int) -> pl.DataFrame:
-    """The earliest full league-wide roster snapshot of `season`.
+def _snapshot_rows(season: int, when: str = "latest") -> pl.DataFrame:
+    """One full league-wide roster snapshot of `season` -- the newest one, or week 1 for a backtest.
 
-    Two datasets carry rosters and only one of them is a snapshot in every season. `rosters_weekly`
-    is a genuine week-by-week capture for 2016-2025 but stops at the last complete season, while the
-    `rosters` table we refresh ourselves is the week-1 snapshot for 2026 and, for earlier seasons in
-    the shared lake, a sparse file of a few hundred rows that is not a roster at all. So the weekly
-    capture is preferred where it exists and the size check catches the case where neither is whole --
-    which the backtest needs and the projection never exercised, because 2026 only has the one.
+    Two datasets carry rosters and only one of them is a snapshot in every season. `rosters_weekly` is
+    a genuine week-by-week capture for 2016-2025 but stops at the last complete season, while the
+    `rosters` table we refresh ourselves is a *live* snapshot of the projection season -- upstream
+    rewrites the same file as transactions happen -- and, for earlier seasons in the shared lake, a
+    sparse file of a few hundred rows that is not a roster at all.
+
+    So both the table preference and the week depend on what is being asked for, and getting either
+    backwards is the same silent failure: a roster frozen at the start of the season.
+
+    - `when="preseason"`, which is what a backtest asks for: the weekly capture, at its lowest week,
+      so the run sees the roster a user would have seen in August and nothing it learned later.
+    - anything else, which is the projection season: our own refreshed snapshot first, and the highest
+      week rather than the lowest. Preferring the weekly capture here would trade a file we refresh
+      ourselves every morning for one that arrives on the other repo's schedule, and taking its lowest
+      week would pin the population to week 1 for the rest of the season -- so a receiver traded in
+      October would still be projected on the team that traded him, with a share of its targets, for
+      every remaining week. That is the failure this ordering exists to prevent, and it costs nothing
+      today only because 2026 has no weekly capture yet.
+
+    The size check catches the case where neither table is whole, which is why the preference is a
+    fallback chain rather than a single choice.
     """
+    preseason = when == "preseason"
     tried = []
-    for dataset in ("rosters_weekly", "rosters"):
+    for dataset in (("rosters_weekly", "rosters") if preseason else ("rosters", "rosters_weekly")):
         try:
             df = lake.read(dataset, layer="raw", seasons=(season,))
         except FileNotFoundError:
@@ -282,13 +298,16 @@ def _week1_rows(season: int) -> pl.DataFrame:
         if "game_type" in df.columns:
             df = df.filter(pl.col("game_type") == "REG")
         if "week" in df.columns:
-            df = df.filter(pl.col("week") == pl.col("week").min())
+            edge = pl.col("week").min() if preseason else pl.col("week").max()
+            df = df.filter(pl.col("week") == edge)
         missing = [c for c in REQUIRED_ROSTER_COLUMNS if c not in df.columns]
         tried.append(f"{dataset}={df.height}" + (f" (no {', '.join(missing)})" if missing else ""))
         if df.height >= MIN_SNAPSHOT_ROWS and not missing:
             return df
+    edge_name = "week-1" if preseason else "current"
     raise FileNotFoundError(
-        f"no league-wide week-1 roster snapshot for {season} (found {', '.join(tried) or 'nothing'})"
+        f"no league-wide {edge_name} roster snapshot for {season} "
+        f"(found {', '.join(tried) or 'nothing'})"
     )
 
 
@@ -299,8 +318,12 @@ def roster(season: int = PROJ_SEASON, when: str = "latest") -> pl.DataFrame:
     One row per player. `charted` says whether the depth chart listed him at this position, and
     `chart_team` says where -- a disagreement is resolved to the roster, because the roster is the
     fresher of the two and is the one that decides who is actually on the team.
+
+    `when` picks the snapshot for both sources, so the chart and the roster are read as of the same
+    moment: `"latest"` for the season being projected, `"preseason"` for a backtest that must not see
+    anything published after week 1.
     """
-    ros = _week1_rows(season)
+    ros = _snapshot_rows(season, when)
     have = set(ros.columns)
     ros = (
         ros.filter(pl.col("gsis_id").is_not_null() & pl.col("position").is_in(OFFENSE_POSITIONS))

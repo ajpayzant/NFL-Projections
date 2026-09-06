@@ -56,7 +56,7 @@ def test_the_roster_is_the_population_and_the_chart_cannot_add_to_it(ros):
     # of the two roster tables is the snapshot and how to cut a week out of it, and a test that
     # reimplements that decision tests its own copy. The 2026 snapshot stopped carrying a `week` column
     # partway through the season, which this test asserted on and the module did not.
-    raw = roster._week1_rows(PROJ_SEASON)
+    raw = roster._snapshot_rows(PROJ_SEASON)
     expected = set(
         raw.filter(pl.col("position").is_in(["QB", "RB", "FB", "WR", "TE"]))["gsis_id"]
         .drop_nulls().to_list()
@@ -66,6 +66,55 @@ def test_the_roster_is_the_population_and_the_chart_cannot_add_to_it(ros):
     chart_only = set(depth.depth_chart(PROJ_SEASON, "latest")["player_id"]) - expected
     assert chart_only, "no chart-only players at all would mean the sources agree, which they do not"
     assert not chart_only & set(ros["player_id"])
+
+
+def test_the_projection_reads_the_newest_roster_snapshot_and_a_backtest_reads_week_one():
+    """The one that stops a mid-season trade being projected on the team that made it.
+
+    Both roster tables are cumulative and both carry a week, so the population depends entirely on
+    which edge of which table is taken -- and the wrong edge is silent. A run pinned to week 1 keeps
+    projecting a receiver on the roster he was traded off in October, with a share of that team's
+    targets, for every remaining week, and nothing about the board says so.
+
+    So the two callers get the two answers: the projection season takes the newest snapshot, and a
+    backtest takes week 1 because it must not see anything published after the season it is scoring.
+    """
+    latest = roster._snapshot_rows(PROJ_SEASON, "latest")
+    pre = roster._snapshot_rows(PROJ_SEASON, "preseason")
+    for got in (latest, pre):
+        assert got.height >= roster.MIN_SNAPSHOT_ROWS
+        assert not [c for c in roster.REQUIRED_ROSTER_COLUMNS if c not in got.columns]
+    if "week" in latest.columns and "week" in pre.columns:
+        assert latest["week"].max() >= pre["week"].max()
+    # and a backtest season, which is the case the ordering was got wrong for: the weekly capture is
+    # the only one of the two tables that is a real roster before 2026
+    old = roster._snapshot_rows(PROJ_SEASON - 1, "preseason")
+    assert old.height >= roster.MIN_SNAPSHOT_ROWS
+    if "week" in old.columns:
+        assert int(old["week"].min()) == int(old["week"].max()) == 1
+
+
+def test_a_released_player_is_carried_at_zero_rather_than_quietly_dropped(ros, part):
+    """Membership is the roster's answer, so a man it says was cut stays in the frame worth nothing.
+
+    Both halves matter. He stays because the roster is where the population comes from and dropping him
+    at source would leave no way to ask what a team let go -- and because the depth chart has already
+    forgotten him, so there would be nothing to read a name off. He is worth zero because the stated
+    factor for his status is zero, which is what makes him harmless: he claims no share of any pool, so
+    the receivers who are actually on the team are not divided against a man who is not there.
+    """
+    gone = ros.filter(pl.col("status").is_in(["CUT", "RET", "EXE", "TRC"]))
+    if gone.is_empty():
+        pytest.skip("no released players on the current snapshot")
+    # A released man is off the chart, which is why the roster has to be the one that carries him: there
+    # would be nothing else to read his name off. Only the released ones -- the exempt list is a status a
+    # player holds while still being somebody the team charts, which is why it is worth a factor of its
+    # own rather than being folded in with a cut.
+    assert not gone.filter(pl.col("status").is_in(["CUT", "RET"]))["charted"].any()
+    theirs = part.filter(pl.col("player_id").is_in(gone["player_id"].to_list()))
+    assert theirs.height == gone.height
+    assert float(theirs["expected_games"].max()) == pytest.approx(0.0)
+    assert float(theirs["active_weeks"].max()) == pytest.approx(0.0)
 
 
 def test_every_team_is_present_with_a_believable_offence(ros):

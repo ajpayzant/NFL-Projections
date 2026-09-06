@@ -1123,8 +1123,33 @@ def team_filter(v: View, key: str = "team") -> list[str]:
     return st.multiselect("Team", teams, default=[], key=key)
 
 
+# Roster statuses that mean the man is not on the team the row says he is on. He is still in the frame,
+# because the roster is where the projection's population comes from and dropping a name at source would
+# leave no way to ask *who did this team release*; he is worth nothing, because `Settings`
+# `status_availability` puts every one of these at 0.0 -- which is measurable rather than asserted here:
+# the whole set claims 0.00% of the league's targets and 0.00% of its carries. So hiding them from a
+# board costs no information and takes a hundred and fifty dead rows out of every list on it.
+OFF_ROSTER = ("CUT", "RET", "EXE", "TRC")
+
+
+def roster_filter(key: str = "gone") -> bool:
+    """Whether to hide the players their own team has released. On by default, because they score zero.
+
+    A control rather than a hard filter: the twenty minutes after a cut-down day is exactly when a user
+    wants to see who a team let go and what the projection had him worth, and a board that silently
+    dropped him would answer that question with a shrug.
+    """
+    return st.toggle(
+        "Hide released", value=True, key=key,
+        help="Players the roster carries with a status that means they are off the team — released, "
+             "retired, or on the exempt list. Every one of them projects zero games and takes no share "
+             "of any pool, so hiding them only removes rows. Turn it off to see who a team cut.",
+    )
+
+
 def apply_filters(
-    df: pl.DataFrame, positions: list[str], teams: list[str], search: str = ""
+    df: pl.DataFrame, positions: list[str], teams: list[str], search: str = "",
+    hide_gone: bool = False,
 ) -> pl.DataFrame:
     out = df
     if positions:
@@ -1133,6 +1158,10 @@ def apply_filters(
         out = out.filter(pl.col("team").is_in(teams))
     if search:
         out = out.filter(pl.col("player").str.to_lowercase().str.contains(search.lower().strip()))
+    # `status` is absent from some frames this is called on -- the per-season history table has no
+    # roster in it -- and a missing column is a filter that cannot apply rather than an error.
+    if hide_gone and "status" in out.columns:
+        out = out.filter(~pl.col("status").is_in(list(OFF_ROSTER)))
     return out
 
 
@@ -1804,6 +1833,29 @@ def release_editor(v: View, chart: pl.DataFrame, team: str, key: str = "release"
                       help="put everybody back on this team's chart"):
         reinstate(*gone_ids)
         st.rerun()
+
+    # The releases the roster file has already made, offered as one button. Reading a status the source
+    # ships and re-typing it by hand is the kind of work a tool exists to not make somebody do, and it
+    # is the whole of the work in the week after cutdown day -- this snapshot carries 138 released
+    # offensive players across the league. The suggestion is a button rather than an automatic edit
+    # because a release is recorded in the scenario as a decision, and it stays a decision: it appears
+    # in the edits list under the user's name, ↺ roster puts everybody back, and a status that turns out
+    # to be premature costs one click rather than an argument with the model.
+    if "status" in on.columns:
+        says_gone = [r["player_id"] for r in on.rows(named=True)
+                     if r.get("status") in OFF_ROSTER and r["player_id"] not in set(gone_ids)]
+        if says_gone:
+            row = st.columns([5, 1])
+            row[0].caption(
+                f"The roster file already lists **{len(says_gone)} of these men as off this team** — "
+                "released, retired or exempt. Each one projects zero games and takes no share of any "
+                "pool, so releasing them changes no other player's numbers; it renumbers the rooms "
+                "behind them and takes the names off the board."
+            )
+            if row[1].button(f"Release {len(says_gone)}", key=_keyed(f"{key}:{team}:sayssogone"),
+                             help="every man this team's own roster file says it has let go"):
+                release(*says_gone)
+                st.rerun()
 
     picked = st.multiselect(
         "Off the roster", options, default=gone_ids, key=_keyed(f"{key}:{team}"),
@@ -3756,6 +3808,73 @@ def status_assumptions(v: View) -> pl.DataFrame:
         .with_columns(pl.col("players").fill_null(0))
         .sort(["players", "availability"], descending=[True, True])
     )
+
+
+def status_editor(v: View, key: str = "status") -> None:
+    """The stated factors, editable, with the population each one is deciding beside it.
+
+    One number per status the roster actually uses, because a control for a status nobody holds is a
+    control that can only be got wrong. The statuses with no players are still listed underneath as
+    text: they are part of the stated assumption even when they are deciding nothing this week, and a
+    reader who cannot see `RET = 0` has to wonder whether retirement is handled at all.
+
+    Written as a league patch rather than as edits on the players, which is the whole reason this is a
+    control. A patch is one line in the scenario, it applies to whoever holds the status *after* the
+    next roster refresh, and dropping it puts every one of those players back. Two hundred
+    `expected_games = 0` edits do none of those things -- least of all the second, which is what makes
+    the hand version wrong rather than merely tedious: a man cut in September and signed in October
+    keeps the zero somebody typed while he was on the street.
+    """
+    table = status_assumptions(v)
+    live_now = dict(v.settings.status_availability)
+    held = table.filter(pl.col("players") > 0)
+    idle = table.filter(pl.col("players") == 0)
+
+    part = participation(v)
+    games = dict(
+        part.group_by("status").agg(pl.col("expected_games").mean().alias("g"))
+        .iter_rows()
+    ) if "expected_games" in part.columns else {}
+
+    wanted: dict[str, float] = {}
+    rows = list(held.iter_rows(named=True))
+    for chunk in [rows[i:i + 4] for i in range(0, len(rows), 4)]:
+        cols = st.columns(4)
+        for col, row in zip(cols, chunk):
+            s = row["status"]
+            with col:
+                wanted[s] = st.number_input(
+                    f"`{s}` — {row['means']}", 0.0, 1.0, float(live_now.get(s, 1.0)), 0.05,
+                    key=f"{key}:{s}",
+                    help=f"{row['players']:,} players hold this status, projected for "
+                         f"{games.get(s, 0.0):.1f} games each on the current factor.",
+                )
+    if idle.height:
+        st.caption("Deciding nobody this week: "
+                   + " · ".join(f"`{r['status']}` = {r['availability']:g}"
+                                for r in idle.iter_rows(named=True)))
+
+    sc = live()
+    patch = {s: f for s, f in wanted.items() if f != live_now.get(s)}
+    if patch:
+        set_live(sc.patch_league(status_availability={**sc.league.get("status_availability", {}),
+                                                     **patch}))
+        st.rerun()
+    if sc.league.get("status_availability"):
+        moved = sc.league["status_availability"]
+        left, right = st.columns([4, 1])
+        with left:
+            chips(*[f"{s} = {f:g}" for s, f in sorted(moved.items())])
+        with right:
+            if st.button("↺ Back to the stated defaults", key=f"{key}:reset"):
+                # The widgets have to be forgotten as well as the patch dropped. A `number_input`
+                # remembers what was typed into it, so a reset that only cleared the scenario would be
+                # undone by the same widget re-reporting the old value on the very next rerun.
+                for s in wanted:
+                    st.session_state.pop(f"{key}:{s}", None)
+                set_live(sc.patch_league(
+                    status_availability=overrides.league_defaults()["status_availability"]))
+                st.rerun()
 
 
 def availability_board(v: View, seasons: tuple[int, ...] = HISTORY_VIEW) -> pl.DataFrame:
