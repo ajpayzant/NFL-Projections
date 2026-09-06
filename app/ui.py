@@ -169,6 +169,21 @@ def drop_edit(level: str, key_value: str, field_name: str, week: int | None = No
         edit(*keep)
 
 
+def drop_all(level: str, *keys: str) -> int:
+    """Drop every edit on these players or teams and return how many went. The un-override.
+
+    The counterpart of `edit`: same funnel, same autosave, one act. It exists because holding an edit at
+    what was typed only pays off if the reader can go back to following the engine on one man without
+    hunting his rows -- "override the players you have an opinion about, normalise the rest from there"
+    is only true if walking a man back is one button rather than seven.
+    """
+    was = live()
+    went = sum(1 for o in was.items if o.level == level and o.key in set(keys))
+    if went:
+        set_live(was.clear_keys(level, keys))
+    return went
+
+
 def released_ids() -> list[str]:
     """Everybody the live scenario has taken off a roster, in the order the edits were made.
 
@@ -459,16 +474,29 @@ def _update_panel() -> None:
 # --------------------------------------------------------------------------- #
 # the projection, under one scenario
 # --------------------------------------------------------------------------- #
-# How many *scenarios* worth of anything to keep. `st.cache_data` never evicts unless it is told a
+# How many *scenarios* worth of anything to keep. Streamlit's caches never evict unless they are told a
 # bound, and a session spent making overrides is a session producing one new scenario digest per edit
 # -- so an unbounded cache on anything keyed by a `View` grows for as long as the tab is open, and the
-# process dies rather than the cache. One run pickles to ~40 MB and the derived frames are on top of
-# that, so this is deliberately small: past the last few scenarios the run they were cut from has been
-# evicted anyway, and recomputing is ~0.7s.
+# process dies rather than the cache. One run is ~40 MB and the derived frames are on top of that, so
+# this is deliberately small: past the last few scenarios the run they were cut from has been evicted
+# anyway, and recomputing is ~0.7s.
 SCENARIO_ENTRIES = 8
 
 
-@st.cache_data(show_spinner="projecting the season", max_entries=SCENARIO_ENTRIES)
+# `cache_resource` rather than `cache_data`, which is the one place in the app where the difference
+# matters. `cache_data` keeps its entries as *pickled bytes* and unpickles them on every hit, and a
+# polars frame's pickle is polars' own binary serialisation -- so a cache hit here meant a 42 MB
+# `DataFrame.deserialize` inside a native extension, several times per keystroke. That call is what took
+# the server down mid-session with `Windows fatal exception: access violation`: no Python traceback,
+# because the fault is below Python, which is why it presented as "lost connection to server" and not as
+# an error on the page. `cache_resource` hands back the object itself, so the round-trip does not happen
+# and neither can the fault in it.
+#
+# Safe here for a specific reason, not by luck: `Run` is a frozen dataclass of polars frames, and every
+# polars operation this app performs returns a new frame rather than mutating one. Nothing can write
+# through the shared reference. Anything that later wants to mutate a frame out of a `Run` has to clone
+# it first, or every page holding that run sees the change.
+@st.cache_resource(show_spinner="projecting the season", max_entries=SCENARIO_ENTRIES)
 def _run(payload: str, season: int) -> overrides.Run:
     sc = Scenario.from_json(payload)
     prev = actuals((LAST_COMPLETE_SEASON,), sc.scoring or "ppr")
@@ -853,8 +881,10 @@ def range_config(*, per_game: bool = False) -> dict:
     digits = 2 if per_game else 1
     return {
         **fixed(digits, "p5", "p25", "p50", "p75", "p95", "floor", "ceiling", "range",
-                "mean", "sim_mean", "sim_sd", "sim_vs_projected", "projected"),
-        **percent("boom_rate", "bust_rate", "volatility"),
+                "mean", "sim_mean", "sim_sd", "sim_vs_projected", "projected",
+                "week_p5", "week_p50", "week_p95", "week_floor", "week_ceiling",
+                "floor_playing", "median_playing"),
+        **percent("boom_rate", "bust_rate", "volatility", "p_zero"),
         **fixed(1, "games_mean", "games_p5", "games_p50", "games_p95"),
     }
 
@@ -929,9 +959,12 @@ LABELS = {
     "team_disagreement": "sources disagree", "years_exp": "years in the league",
     "draft_pick": "draft pick", "is_rookie": "rookie", "alignment": "where he lines up",
     "vs_starter": "vs average starter", "drop_next": "drop to the next man",
+    "if_healthy": "points over a full 17",
     "points_per_game": "points per game", "position_rank": "rank at position",
     "overall_rank": "overall rank", "startable": "startable",
     "has_market": "line posted", "is_home": "at home", "implied_points": "implied points",
+    "p_zero": "chance of nothing", "floor_playing": "floor if he plays",
+    "median_playing": "median if he plays", "week_median_rank": "rank on the simulated median",
     "seconds_per_play": "seconds per play", "rest_days": "days rest", "div_game": "division game",
     "rz_targets": "red-zone targets", "rz_carries": "red-zone carries",
     "rz_target_share": "red-zone target share", "rz_carry_share": "red-zone carry share",
@@ -963,8 +996,10 @@ DIGITS = {
     "fantasy_points": 1, "new_fantasy_points": 1, "d_fantasy_points": 1, "points_per_game": 2,
     "games": 1, "weeks": 1, "expected_games": 1, "games_if_available": 1, "prior_games": 1,
     "obs_games": 1, "vs_starter": 1, "drop_next": 1, "delta_points": 1, "last_points": 1,
+    "if_healthy": 1,
     "last_games": 1, "spread": 1, "total": 1, "implied_points": 1, "points": 1, "temp": 0, "wind": 0,
     "p5": 1, "p25": 1, "p50": 1, "p75": 1, "p95": 1, "floor": 1, "ceiling": 1, "range": 1,
+    "floor_playing": 1, "median_playing": 1, "p_zero": 3,
     "mean": 1, "sim_mean": 1, "sim_sd": 1, "sim_vs_projected": 1, "projected": 1,
     "projected_games": 1, "games_mean": 1, "games_p5": 1, "games_p50": 1, "games_p95": 1,
     "age": 1, "years_exp": 0, "n": 0, "seconds_per_play": 2, "epa_per_play": 3, "proe": 3,
@@ -980,7 +1015,7 @@ DIGITS = {
 PERCENT_COLUMNS = ("own_weight", "games_own_weight", "p_play", "active_weeks", "presence",
                    "status_factor", "volatility", "attendance", "rate", "pool_share", "share",
                    "cover_90", "cover_50", "below", "above", "never_played", "covered_pct",
-                   "of_team")
+                   "of_team", "p_zero")
 PERCENT_PARTS = ("_share", "share_", "_rate", "_pct", "participation", "_pctile")
 
 
@@ -1510,9 +1545,23 @@ def stat_blocks(row: dict, position: str | None = None, per_game: dict | None = 
 
     The point of the cards rather than a column of numbers: the season and the per-game figure sit
     together, and a lineup decision is made on the second one.
+
+    The sub-line also carries the same stat over a full seventeen, because that is the number the reader
+    already has in their head. A season total here is availability-weighted -- a receiver at 16.1
+    expected games is projected for 16.1 games' worth of targets -- so it lands under the career line of
+    a man who has been healthy, and the gap is durability rather than a lower opinion of him. Showing
+    both makes that one glance instead of one argument.
     """
     pos = position or row.get("position") or ""
     line = STAT_LINE.get(pos, ())
+
+    def sub(f: str) -> str:
+        if per_game is None or per_game.get(f) is None:
+            return ""
+        pg = float(per_game[f])
+        d = max(stat_digits(f), 1)
+        return f"{pg:,.{d}f} / g · {pg * FULL_SEASON:,.{0 if pg * FULL_SEASON >= 20 else d}f} over 17"
+
     for group in STAT_BLOCKS.get(pos, STAT_BLOCKS["WR"]):
         fields = [c for c in STAT_GROUPS[group]
                   if row.get(c) is not None
@@ -1520,9 +1569,7 @@ def stat_blocks(row: dict, position: str | None = None, per_game: dict | None = 
         if not fields:
             continue
         st.caption(group)
-        tiles([{"name": label(f), "value": row[f], "digits": stat_digits(f),
-                "sub": ("" if per_game is None or per_game.get(f) is None else
-                        f"{float(per_game[f]):,.{max(stat_digits(f), 1)}f} / g")}
+        tiles([{"name": label(f), "value": row[f], "digits": stat_digits(f), "sub": sub(f)}
                for f in fields])
 
 
@@ -2556,6 +2603,18 @@ def edit_list(level: str, key_value: str, heading: str | None = None,
                          help="drop this edit and follow the engine again"):
             drop_edit(level, key_value, o.field, o.week)
             st.rerun()
+    # One button for all of them, wherever a man's edits are listed. Two overrides is a list to walk and
+    # nine is not, and the whole way the tool is meant to be used -- a strong opinion on the players who
+    # matter, the engine everywhere else -- needs the door to swing both ways.
+    if len(items) > 1:
+        foot = st.columns([3, 5])
+        if foot[0].button(f"↺ Drop all {len(items)}",
+                          key=_keyed(f"{key}:{level}:{key_value}:all"),
+                          help="follow the engine again on every number for him; his teammates' shares "
+                               "settle back around it"):
+            drop_all(level, key_value)
+            st.rerun()
+        foot[1].caption("Everybody else's edits are left alone.")
     return True
 
 

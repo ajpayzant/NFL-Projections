@@ -46,7 +46,7 @@ from functools import lru_cache
 
 import polars as pl
 
-from src.config import PROJ_SEASON, Settings
+from src.config import PROJ_SEASON, REG_WEEKS, Settings
 from src.data import history, lake
 from src.model import efficiency, opportunity
 
@@ -271,6 +271,12 @@ def board(
       is the first thing anybody checks and the fastest way to spot a projection that has lost its
       mind. `prev` is a season aggregate from `history.player_seasons`; passing it is optional
       because the board must still render when the lake has no prior season.
+    - `if_healthy` is the same projection over a full seventeen games. Every other total here is
+      availability-weighted -- a receiver at 16.1 expected games is projected for 16.1 games of
+      targets -- so it sits under the career line of a man who has been healthy, and a reader with
+      that line in their head reads the gap as a lower opinion of him when it is a durability
+      discount. This column separates the two, and the distance between it and `fantasy_points` is
+      exactly what availability cost him.
 
     Arithmetic only. Formatting, colour and column choice belong to the app.
     """
@@ -282,6 +288,7 @@ def board(
         .cast(pl.Int32).alias("tier"),
         (pl.col("fantasy_points") - pl.col("fantasy_points").shift(-1).over("position"))
         .alias("drop_next"),
+        (pl.col("points_per_game") * float(REG_WEEKS - 1)).alias("if_healthy"),
     )
     starters = pl.col("position").replace_strict(
         settings.starters, default=0, return_dtype=pl.Int32

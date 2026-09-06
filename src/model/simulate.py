@@ -151,6 +151,19 @@ TRACKED = ("targets", "carries", "receptions", "receiving_yards", "receiving_tds
 
 QUANTILES = (0.05, 0.25, 0.50, 0.75, 0.95)
 
+# Every player's every week gets a floor and a ceiling, and the draws behind them are not kept. Ten
+# thousand draws of nine hundred players over eighteen weeks is 660MB, which is why the weekly range used
+# to be a privilege of the handful of players a page asked for by name -- and a start/sit call is exactly
+# where a floor earns its keep, so that was the wrong half of the board to serve. A histogram costs the
+# same whatever the draw count: bin 0 is the mass at exactly zero, kept apart because a week he does not
+# play is the point of the exercise rather than a small number, and `HIST_BINS` uniform bins carry the
+# rest up to `HIST_SPAN` times his per-play projection. That is 17MB of counters for the whole board and
+# it buys quantiles good to `hi / HIST_BINS` -- about half a tenth of a point for a bench player and half
+# a point for a bell-cow, well inside what a simulated range means.
+HIST_BINS = 256
+HIST_SPAN = 8.0            # multiple of the per-play projection the top bin sits at
+HIST_FLOOR = 10.0          # ... but never so low that a zero-projection week has no room at all
+
 
 # --------------------------------------------------------------------------- #
 # dispersion
@@ -566,7 +579,11 @@ def measure(
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, eq=False)
 class Sim:
-    """The result of one run: a season frame everybody is in, and full draws for the ones asked for.
+    """The result of one run: two frames everybody is in, and per-stat detail for the ones asked for.
+
+    `season` is one row a player and `weekly` is one row a player-week; both carry a floor and a ceiling
+    for the whole board. `stats` is the only frame still restricted to the `detail` players, because ten
+    tracked counts times nine hundred players is a table nobody reads at that width.
 
     `points_draws` is (players, draws) of season fantasy points, in the row order of `season`. It is
     kept rather than reduced to quantiles because "what are the odds he clears 250" is a question a
@@ -668,6 +685,9 @@ class _Week:
     grp: dict[str, _Grp]
     stats: dict[str, np.ndarray]       # tracked stat -> per-play value, full length
     stat_group: dict[str, str]         # tracked stat -> the group whose shock moves it
+    upid: np.ndarray                   # week slot -> player index, one slot per player in the week
+    uof: np.ndarray                    # row -> week slot, for the rare player with two rows in a week
+    hi: np.ndarray                     # week slot -> top of his weekly histogram
 
 
 def _blocks(keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -774,10 +794,24 @@ def _prepare(
                 stats[s] = per_play(s)
 
         pidx = np.array([pmap[x] for x in w["player_id"]])
+        unique = len(np.unique(pidx)) == len(pidx)
+        # The weekly histogram is per player, not per row, so it needs the week collapsed onto its
+        # players. Almost always that is the identity -- one row a player a week -- and the identity is
+        # taken as-is so the common case pays nothing.
+        if unique:
+            upid, uof = pidx, np.arange(len(pidx))
+        else:
+            upid, uof = np.unique(pidx, return_inverse=True)
+        # The top of each player's histogram, from what the projection says he does *per play*: the
+        # projected line has availability inside it, and the week being binned is a week he played, so
+        # scaling the blended number would put a fragile starter's ceiling below his ordinary Sunday.
+        pperplay = np.zeros(upid.size, np.float32)
+        np.add.at(pperplay, uof, per_play("fantasy_points"))
+        hi = np.maximum(HIST_SPAN * pperplay, HIST_FLOOR)
         out.append(_Week(
-            week=int(week), rows=len(p), pidx=pidx, unique=len(np.unique(pidx)) == len(pidx),
+            week=int(week), rows=len(p), pidx=pidx, unique=unique,
             gof=gof, sign=sign, n_teams=len(team_names), p_play=p, chan=chan, grp=grp,
-            stats=stats, stat_group=stat_group,
+            stats=stats, stat_group=stat_group, upid=upid, uof=uof, hi=hi,
         ))
     return out, players, positions, tiers
 
@@ -874,7 +908,16 @@ def run(
     dset = [p for p in detail if p in set(players)]
     didx = np.array([players.index(p) for p in dset], dtype=int) if dset else np.zeros(0, int)
     stat_draws = {s: np.zeros((len(dset), n_draws), np.float32) for s in TRACKED} if dset else {}
-    weekly_pts = (np.zeros((len(dset), len(weeks), n_draws), np.float32) if dset else None)
+
+    # every player's every week, as counters rather than draws -- see HIST_BINS
+    n_weeks = max(len(weeks), 1)
+    n_slots = n_players * n_weeks
+    hist = np.zeros((n_slots, HIST_BINS + 1), np.int32)
+    hist_hi = np.zeros(n_slots, np.float32)
+    week_sum = np.zeros(n_slots, np.float64)
+    week_boom = np.zeros(n_slots, np.int64)
+    week_bust = np.zeros(n_slots, np.int64)
+    seen = np.zeros(n_slots, bool)
 
     # A team's identity is only needed within a week -- the teams playing in week 3 are the same 32 --
     # so the persistent team draw is indexed by the block position, which is stable because every week
@@ -987,21 +1030,42 @@ def run(
 
             if w.unique:
                 season_pts[w.pidx] += pts
+                pw = pts
             else:
                 np.add.at(season_pts, w.pidx, pts)
-            booms += np.bincount(w.pidx, weights=(pts >= boom_line[w.pidx][:, None]).sum(1),
-                                 minlength=n_players)
-            busts += np.bincount(w.pidx, weights=(pts <= bust_line[w.pidx][:, None]).sum(1),
-                                 minlength=n_players)
+                pw = np.zeros((w.upid.size, c), np.float32)
+                np.add.at(pw, w.uof, pts)
+
+            # --- the week as a distribution ---------------------------------- #
+            # Off `pw` rather than off the rows, so a player with two rows in a week is one week rather
+            # than two half-weeks -- which is also what a boom is: a boom is a Sunday clearing the line,
+            # not a stat line inside one.
+            slot = w.upid * n_weeks + wi
+            over = boom_line[w.upid][:, None]
+            under = bust_line[w.upid][:, None]
+            booms[w.upid] += (pw >= over).sum(1)
+            busts[w.upid] += (pw <= under).sum(1)
+            week_boom[slot] += (pw >= over).sum(1)
+            week_bust[slot] += (pw <= under).sum(1)
+            week_sum[slot] += pw.sum(1)
+            # bin 0 is exactly zero -- and a negative week, which only a fumble-only line can be, goes
+            # there too rather than off the bottom of a histogram that starts at zero
+            b = np.where(pw > 0.0,
+                         1 + np.minimum((pw / w.hi[:, None] * HIST_BINS).astype(np.int32),
+                                        HIST_BINS - 1),
+                         0)
+            nb = HIST_BINS + 1
+            flat = (np.arange(w.upid.size, dtype=np.int64)[:, None] * nb + b).ravel()
+            hist[slot] += (np.bincount(flat, minlength=w.upid.size * nb)
+                           .reshape(w.upid.size, nb).astype(np.int32))
+            hist_hi[slot] = w.hi
+            seen[slot] = True
 
             if dset:
                 take = {p: i for i, p in enumerate(didx)}
                 rows = np.array([i for i, p in enumerate(w.pidx) if p in take], dtype=int)
                 if rows.size:
                     to = [take[p] for p in w.pidx[rows]]
-                    # `weekly_pts` spans every draw, so it takes the chunk's slice -- unlike
-                    # `season_stats`, which is a per-chunk accumulator copied out below
-                    weekly_pts[to, wi, sl] = pts[rows]
                     for s, arr in season_stats.items():
                         if s not in w.stats:
                             continue
@@ -1022,7 +1086,6 @@ def run(
         for s, arr in season_stats.items():
             stat_draws[s][:, sl] = arr
 
-    n_weeks = max(len(weeks), 1)
     season = _season_frame(wk, players, positions, tiers, points_draws, games_draws,
                            booms / (n_weeks * n_draws), busts / (n_weeks * n_draws))
     # `_season_frame` sorts by median, so the draws are permuted to match it rather than left in the
@@ -1033,8 +1096,8 @@ def run(
     order = np.fromiter((where[p] for p in season["player_id"]), np.int64, season.height)
     return Sim(
         season=season,
-        weekly=(_weekly_frame(dset, weeks, weekly_pts, boom_line[didx], bust_line[didx])
-                if dset else _empty_weekly()),
+        weekly=_weekly_frame(players, weeks, hist, hist_hi, week_sum, week_boom, week_bust, seen,
+                             n_draws),
         stats=_stat_frame(dset, stat_draws) if dset else _empty_stats(),
         points_draws=points_draws[order],
         index={p: i for i, p in enumerate(season["player_id"])},
@@ -1084,30 +1147,86 @@ def _season_frame(wk, players, positions, tiers, pts, games, boom, bust) -> pl.D
     )
 
 
-def _weekly_frame(dset, weeks, weekly_pts, boom, bust) -> pl.DataFrame:
-    """Each of the player's weeks as a distribution. A bye is absent rather than a zero."""
-    rows = []
-    for i, pid in enumerate(dset):
-        for wi, w in enumerate(weeks):
-            a = weekly_pts[i, wi]
-            q = np.quantile(a, QUANTILES)
-            rows.append({"player_id": pid, "week": w.week, "mean": float(a.mean()),
-                         "p5": float(q[0]), "p25": float(q[1]), "p50": float(q[2]),
-                         "p75": float(q[3]), "p95": float(q[4]),
-                         "boom_rate": float((a >= boom[i]).mean()),
-                         "bust_rate": float((a <= bust[i]).mean())})
-    return pl.DataFrame(rows, schema=_WEEKLY_SCHEMA)
+def _hist_q(counts: np.ndarray, hi: np.ndarray, qs=QUANTILES) -> np.ndarray:
+    """Quantiles of distributions held as counts. `(len(qs), n)`, one column per row of `counts`.
+
+    Column 0 of `counts` is the mass at exactly zero and reads back as exactly zero; columns `1..HIST_BINS`
+    divide `(0, hi]` evenly and read back at their midpoints, which is the least wrong single number for a
+    bin and keeps the error at half a bin rather than a whole one.
+
+    The convention is the inverted CDF -- the first bin whose cumulative share reaches `q` -- which is
+    `numpy`'s `lower` rather than its default `linear`. That matters at exactly one place and it is the
+    place that counts: a fragile player whose zero bin holds more than five per cent of his draws has a
+    floor of zero, flatly, instead of an interpolated fraction of a point that reads as "he plays".
+    """
+    total = counts.sum(1, dtype=np.int64)
+    cum = np.cumsum(counts, axis=1, dtype=np.int64)
+    width = hi / float(counts.shape[1] - 1)
+    out = np.zeros((len(qs), counts.shape[0]), np.float64)
+    for k, q in enumerate(qs):
+        # `<` not `<=`: the bin that *reaches* the wanted mass is the quantile, not the one after it
+        j = (cum < np.ceil(q * total)[:, None]).sum(1)
+        j = np.minimum(j, counts.shape[1] - 1)
+        out[k] = np.where(j == 0, 0.0, (j - 0.5) * width)
+    return out
+
+
+def _weekly_frame(players, weeks, hist, hi, wsum, boom, bust, seen, n_draws) -> pl.DataFrame:
+    """Every player's every week as a distribution. A bye is absent rather than a zero.
+
+    The whole board, not the handful of players a caller named: a floor is worth more in a start/sit call
+    than anywhere else on the site, so this is the one frame that had to stop being a privilege. The
+    quantiles come off `HIST_BINS` counters per player-week rather than off stored draws; the mean does
+    not, because a mean is one accumulator and there is no reason to approximate it.
+    """
+    if not weeks:
+        return _empty_weekly()
+    n_weeks = len(weeks)
+    idx = np.flatnonzero(seen)
+    if idx.size == 0:
+        return _empty_weekly()
+    who = np.asarray(players)[idx // n_weeks]
+    when = np.asarray([w.week for w in weeks], np.int64)[idx % n_weeks]
+    counts = hist[idx]
+    q = _hist_q(counts, hi[idx])
+    # The same histogram with the zero bin dropped, which is a different and necessary question.
+    # Measured on held-out seasons, 95% of *startable* player-weeks have a p5 of exactly zero -- and that
+    # is not a bug, it is arithmetic: a man who misses a tenth of his weeks and is held scoreless in a few
+    # more has over five per cent of his Sundays at nothing, so his fifth percentile is nothing. Which
+    # makes the honest floor useless as a column, because it says the same thing about everybody. So the
+    # frame carries both: `p_zero`, the chance he gives you nothing at all, and `floor_playing`, the floor
+    # of the Sundays he did score -- the two halves of what a single p5 was being asked to say at once.
+    warm = counts.copy()
+    warm[:, 0] = 0
+    qw = _hist_q(warm, hi[idx])
+    total = counts.sum(1)
+    return pl.DataFrame({
+        "player_id": who, "week": when,
+        "mean": wsum[idx] / float(n_draws),
+        "p5": q[0], "p25": q[1], "p50": q[2], "p75": q[3], "p95": q[4],
+        "boom_rate": boom[idx] / float(n_draws), "bust_rate": bust[idx] / float(n_draws),
+        "p_zero": counts[:, 0] / np.maximum(total, 1),
+        "floor_playing": np.where(warm.sum(1) > 0, qw[0], 0.0),
+        "median_playing": np.where(warm.sum(1) > 0, qw[2], 0.0),
+    }, schema=_WEEKLY_SCHEMA).with_columns(
+        pl.col("p5").alias("floor"), pl.col("p95").alias("ceiling"),
+        (pl.col("p95") - pl.col("p5")).alias("range"),
+    ).sort(["week", "p50"], descending=[False, True]).with_columns(
+        pl.col("p50").rank("min", descending=True).over("week").cast(pl.Int32).alias("week_median_rank")
+    )
 
 
 _WEEKLY_SCHEMA = {"player_id": pl.String, "week": pl.Int64, "mean": pl.Float64, "p5": pl.Float64,
                   "p25": pl.Float64, "p50": pl.Float64, "p75": pl.Float64, "p95": pl.Float64,
-                  "boom_rate": pl.Float64, "bust_rate": pl.Float64}
+                  "boom_rate": pl.Float64, "bust_rate": pl.Float64, "p_zero": pl.Float64,
+                  "floor_playing": pl.Float64, "median_playing": pl.Float64}
 _STAT_SCHEMA = {"player_id": pl.String, "stat": pl.String, "mean": pl.Float64, "p5": pl.Float64,
                 "p25": pl.Float64, "p50": pl.Float64, "p75": pl.Float64, "p95": pl.Float64}
 
 
 def _empty_weekly() -> pl.DataFrame:
-    return pl.DataFrame(schema=_WEEKLY_SCHEMA)
+    return pl.DataFrame(schema={**_WEEKLY_SCHEMA, "floor": pl.Float64, "ceiling": pl.Float64,
+                               "range": pl.Float64, "week_median_rank": pl.Int32})
 
 
 def _empty_stats() -> pl.DataFrame:
@@ -1245,16 +1364,159 @@ def coverage(sim: Sim, actual: pl.DataFrame, view: str = "all", min_projected: f
     return pl.DataFrame(rows)
 
 
-def _ex_ante_weekly(season: int, settings: Settings):
+def _ex_ante_weekly(season: int, settings: Settings, stats: bool = False):
     """The held-out weekly projection for a played season, and what actually happened."""
     from src.model import backtest
     ex = backtest.ex_ante(season, settings)
     wk = backtest.project_weekly(season, settings, ex)
     seasonal = backtest.compose.seasonal(wk, season, settings)
-    actual = backtest.score_frame(seasonal, ex).select(
-        "player_id", "a_games", "a_fantasy_points", "played", "regulars", "starters"
-    )
-    return wk, actual
+    scored = backtest.score_frame(seasonal, ex)
+    keep = ["player_id", "a_games", "a_fantasy_points", "played", "regulars", "starters"]
+    if stats:
+        keep += [f"a_{s}" for s in TRACKED if f"a_{s}" in scored.columns]
+    return wk, scored.select(keep)
+
+
+# --------------------------------------------------------------------------- #
+# checking the ranges the calibration does not fit
+# --------------------------------------------------------------------------- #
+# `calibrate` fits one scalar per position on the coverage of *season fantasy points*, and that is the
+# only interval it can be said to have measured. Two others are shipped on the strength of it: the range
+# on each tracked count -- a receiver's targets, a back's carries -- and the range on a single week. Both
+# inherit the scalar without ever having been checked against an outcome, and an interval nobody checked
+# is a claim nobody made. These two functions check them, on the same held-out seasons and the same
+# population rule as `coverage`: chosen on the projection, a zero for whoever never played.
+#
+# They report rather than fit. A coverage that comes back at 0.97 against a claimed 0.90 says the
+# interval is wide, and the honest response is to say so next to the number rather than to bolt a second
+# scalar onto a simulation whose only measured scalar is already doing that job.
+def stat_coverage(sim: Sim, actual: pl.DataFrame, min_projected: float = STARTABLE,
+                  min_n: int = 20) -> pl.DataFrame:
+    """Did the P5-P95 on each tracked count contain the count? One row per position and stat.
+
+    Needs a `sim` run with `detail` covering the population -- the per-stat draws are what the quantiles
+    come from -- which is affordable at backtest draw counts and not at ten thousand.
+    """
+    have = [s for s in TRACKED if f"a_{s}" in actual.columns]
+    wide = sim.stats.pivot(on="stat", index="player_id", values=["p5", "p50", "p95"])
+    j = (sim.season.select("player_id", "position", "projected")
+         .join(actual, on="player_id", how="inner").join(wide, on="player_id", how="inner")
+         .filter(pl.col("projected") > min_projected))
+    rows = []
+    for s in have:
+        lo, mid, hi = f"p5_{s}", f"p50_{s}", f"p95_{s}"
+        if lo not in j.columns:
+            continue
+        # a player the sim never gave this stat to is not a miss on it, he is not in the population:
+        # `_stat_frame` drops an all-zero stat, so the null here means "no receiving line at all"
+        sub = j.drop_nulls(hi)
+        for pos in (*POSITIONS, "ALL"):
+            m = sub if pos == "ALL" else sub.filter(pl.col("position") == pos)
+            if m.height < min_n:
+                continue
+            a, p50 = pl.col(f"a_{s}"), pl.col(mid)
+            rows.append(m.select(
+                pl.lit(pos).alias("position"), pl.lit(s).alias("stat"), pl.len().alias("n"),
+                ((a >= pl.col(lo)) & (a <= pl.col(hi))).mean().alias("cover_90"),
+                (a < pl.col(lo)).mean().alias("below"),
+                (a > pl.col(hi)).mean().alias("above"),
+                (a - p50).median().alias("median_bias"),
+                # the width as a multiple of the median, which is how a reader meets it: "his ceiling is
+                # 1.4x his projection" is the sentence a p95 has to survive
+                (pl.col(hi) / pl.when(p50 > 1e-6).then(p50).otherwise(None)).median()
+                .alias("ceiling_over_median"),
+                (pl.col(lo) / pl.when(p50 > 1e-6).then(p50).otherwise(None)).median()
+                .alias("floor_over_median"),
+                pl.col(mid).median().alias("median_projected"),
+                pl.col(hi).max().alias("highest_ceiling"),
+                a.max().alias("highest_actual"),
+            ).row(0, named=True))
+    return pl.DataFrame(rows)
+
+
+def week_coverage(sim: Sim, actual_weeks: pl.DataFrame, season_actual: pl.DataFrame,
+                  min_projected: float = STARTABLE, min_n: int = 100) -> pl.DataFrame:
+    """Did the weekly P5-P95 contain the week? One row per position, over startable players.
+
+    `actual_weeks` is `player_id, week, a_points` -- and the projection's player-weeks are the
+    population, so a week he missed is a zero rather than an absent row. That is the whole point: the
+    weekly floor is mostly a statement about `p_play`, and dropping the weeks he sat would score the
+    floor only on the weeks it was never about.
+    """
+    who = (sim.season.select("player_id", "position", "projected")
+           .join(season_actual.select("player_id"), on="player_id", how="semi")
+           .filter(pl.col("projected") > min_projected))
+    j = (sim.weekly.join(who, on="player_id", how="inner")
+         .join(actual_weeks, on=["player_id", "week"], how="left")
+         .with_columns(pl.col("a_points").fill_null(0.0)))
+    rows = []
+    a = pl.col("a_points")
+    for pos in (*POSITIONS, "ALL"):
+        m = j if pos == "ALL" else j.filter(pl.col("position") == pos)
+        if m.height < min_n:
+            continue
+        rows.append(m.select(
+            pl.lit(pos).alias("position"), pl.len().alias("n"),
+            ((a >= pl.col("p5")) & (a <= pl.col("p95"))).mean().alias("cover_90"),
+            ((a >= pl.col("p25")) & (a <= pl.col("p75"))).mean().alias("cover_50"),
+            (a < pl.col("p5")).mean().alias("below"),
+            (a > pl.col("p95")).mean().alias("above"),
+            (a - pl.col("p50")).median().alias("median_bias"),
+            (a - pl.col("mean")).mean().alias("mean_bias"),
+            (pl.col("floor") <= 1e-9).mean().alias("share_with_a_zero_floor"),
+            (a <= 1e-9).mean().alias("share_of_weeks_he_scored_nothing"),
+            pl.col("p_zero").mean().alias("mean_p_zero"),
+            # the conditional floor scored on its own terms: the weeks he did put something up
+            ((a > 1e-9) & (a >= pl.col("floor_playing")) & (a <= pl.col("p95"))).sum()
+            .truediv(pl.max_horizontal((a > 1e-9).sum(), 1)).alias("cover_90_playing"),
+        ).row(0, named=True))
+    return pl.DataFrame(rows)
+
+
+def _actual_weeks(season: int, settings: Settings) -> pl.DataFrame:
+    """Every player-week that happened, scored under the app's own rules. `player_id, week, a_points`.
+
+    Scored here from the counts rather than read out of the lake's own `fantasy_points`, because that
+    column is computed under a fixed scoring rule and the interval being checked was simulated under
+    `settings.scoring`. Half a point a reception across a thousand player-weeks is a coverage figure
+    that is wrong for a reason nobody would find.
+    """
+    from src.data import history
+    weights = _scoring_weights(settings.scoring)
+    frames = []
+    for got in (history.skill_weeks((season,)), history.qb_weeks((season,))):
+        if got.is_empty():
+            continue
+        have = [s for s in weights if s in got.columns]
+        frames.append(got.filter(pl.col("season_type") == "REG").select(
+            "player_id", pl.col("week").cast(pl.Int64),
+            sum((pl.col(s).cast(pl.Float64).fill_null(0.0) * weights[s] for s in have),
+                start=pl.lit(0.0)).alias("a_points"),
+        ))
+    if not frames:
+        return pl.DataFrame(schema={"player_id": pl.String, "week": pl.Int64,
+                                    "a_points": pl.Float64})
+    # a two-position player can appear in both frames; his week is one week
+    return pl.concat(frames).group_by("player_id", "week").agg(pl.col("a_points").sum())
+
+
+def check_ranges(targets: tuple[int, ...] | None = None, disp: Dispersion | None = None,
+                 settings: Settings | None = None, draws: int = 1000
+                 ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Every interval the app ships, against held-out outcomes. Returns (per stat, per week)."""
+    from src.model import backtest
+    settings = settings or backtest.base_settings()
+    disp = disp or load()
+    targets = targets or tuple(range(2021, LAST_COMPLETE_SEASON + 1))
+    per_stat, per_week = [], []
+    for season in targets:
+        wk, actual = _ex_ante_weekly(season, settings, stats=True)
+        everyone = tuple(wk["player_id"].unique().to_list())
+        sim = run(wk, settings, disp, draws=draws, detail=everyone)
+        per_stat.append(stat_coverage(sim, actual).with_columns(pl.lit(season).alias("season")))
+        per_week.append(week_coverage(sim, _actual_weeks(season, settings), actual)
+                        .with_columns(pl.lit(season).alias("season")))
+    return pl.concat(per_stat), pl.concat(per_week)
 
 
 def calibrate(
@@ -1427,6 +1689,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fit", action="store_true", help="measure dispersion and save it")
     p.add_argument("--calibrate", action="store_true",
                    help="scale the persistent sigmas to hit out-of-sample coverage, and save")
+    p.add_argument("--check-ranges", action="store_true",
+                   help="report held-out coverage of the two intervals the calibration does not fit: "
+                        "the range on each tracked count, and the range on a single week")
     p.add_argument("--season", type=int, default=PROJ_SEASON)
     p.add_argument("--draws", type=int, default=None)
     p.add_argument("--targets", type=int, nargs="+", default=None)
@@ -1457,7 +1722,46 @@ def main(argv: list[str] | None = None) -> int:
         ).sort("position"))
         print("  `pit_iqr` is what the scale was fitted on and wants 0.500; `median_bias` is what is "
               "left over, and it is the projection's to answer for rather than the interval's")
-    if not (a.fit or a.calibrate):
+    if a.check_ranges:
+        pl.Config.set_tbl_cols(-1)
+        pl.Config.set_tbl_rows(60)
+        per_stat, per_week = check_ranges(tuple(a.targets) if a.targets else None,
+                                          draws=a.draws or 1000)
+        seasons = sorted(per_week["season"].unique().to_list())
+        print(f"\nRANGE CHECK  held-out {seasons[0]}-{seasons[-1]}, players projected over "
+              f"{STARTABLE:.0f} points. `cover_90` wants 0.90.")
+        print("\nPER STAT  the P5-P95 on each tracked count, pooled over the held-out seasons")
+        print(per_stat.group_by("position", "stat").agg(
+            pl.col("n").sum(),
+            (pl.col("cover_90") * pl.col("n")).sum().truediv(pl.col("n").sum()).round(3)
+            .alias("cover_90"),
+            (pl.col("below") * pl.col("n")).sum().truediv(pl.col("n").sum()).round(3).alias("below"),
+            (pl.col("above") * pl.col("n")).sum().truediv(pl.col("n").sum()).round(3).alias("above"),
+            pl.col("median_bias").mean().round(1),
+            pl.col("ceiling_over_median").mean().round(2),
+            pl.col("median_projected").mean().round(1),
+            pl.col("highest_ceiling").max().round(0),
+            pl.col("highest_actual").max().round(0),
+        ).sort("position", "stat"))
+        print("  `median_bias` is the outcome minus the simulated median, so a negative number is a "
+              "count the projection ran over; `ceiling_over_median` is the p95 as a multiple of the "
+              "median, which is the form a reader meets it in.")
+        print("\nPER WEEK  the P5-P95 on one Sunday, over the same players")
+        print(per_week.group_by("position").agg(
+            pl.col("n").sum(),
+            *[(pl.col(c) * pl.col("n")).sum().truediv(pl.col("n").sum()).round(3).alias(c)
+              for c in ("cover_90", "cover_50", "below", "above", "cover_90_playing")],
+            pl.col("median_bias").mean().round(2), pl.col("mean_bias").mean().round(2),
+            pl.col("share_with_a_zero_floor").mean().round(3),
+            pl.col("mean_p_zero").mean().round(3),
+            pl.col("share_of_weeks_he_scored_nothing").mean().round(3),
+        ).sort("position"))
+        print("  `cover_50` wants 0.50. `share_with_a_zero_floor` is why the frame carries a second "
+              "floor: a startable player's honest p5 is zero almost always, so it says the same thing "
+              "about everybody. `mean_p_zero` against `share_of_weeks_he_scored_nothing` is the "
+              "availability claim on its own, and `cover_90_playing` scores the conditional floor over "
+              "the weeks he actually put something up.")
+    if not (a.fit or a.calibrate or a.check_ranges):
         _report(a.season, settings, a.draws or settings.simulation_draws)
     return 0
 

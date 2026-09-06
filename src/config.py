@@ -106,6 +106,28 @@ class Settings:
     normalize_pools: bool = True     # rescale exclusive team pools to sum to 1
     games_projected: int = 17        # per team; per player it is availability-adjusted
 
+    # Who pays when a room claims more of a pool than the pool holds. The residual is taken in
+    # proportion to `claim ** pool_tilt`, so the exponent is the whole behaviour:
+    #
+    #   1.0  every claim loses the same *fraction* of itself -- the flat proportional rescale
+    #   <1   a small claim loses a larger fraction than a big one
+    #   0.0  every claim loses the same *absolute* amount, so the bench empties first
+    #
+    # 1.0 reproduces the old rescale exactly, which is why it is the fallback rather than a value.
+    # The number lives in FITTED/pool_tilt.json and is measured the same way every other constant here
+    # is -- on held-out seasons, `python -m src.model.backtest --fit-tilt` -- and unlike the others, the
+    # measurement came back indifferent. Held-out per-game target and carry MAE moves by 0.04% across
+    # the whole grid from 1.0 down to 0.0, which is noise; the calibration slope of WR targets per game
+    # is 0.95, meaning the projections are already a shade too spread, which argues mildly *against*
+    # taking more from the bench. So this exponent is a preference the accuracy measurement does not
+    # object to rather than a result it produced, and the default is the mildest tilt on the grid.
+    # Read `choose_tilt` before quoting a fitted value for it.
+    pool_tilt: float | None = None    # None means use the fitted value
+    # An explicit share override is held at what was typed and the residual is taken from the rest of
+    # the room instead. Off, a number a user typed is silently rescaled with everything else -- which
+    # made "set his target share to 0.30" deliver 0.2545 and report itself applied.
+    lock_edited_shares: bool = True
+
     # Preseason roster status -> the fraction of his fitted expected games a player is credited with.
     # The one number in the engine that is stated rather than fitted: 20 of 2026's 915 offensive
     # players are anything but ACT, and the historical week-1 status column is missing for 2017-2018

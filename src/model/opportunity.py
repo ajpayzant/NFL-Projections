@@ -26,19 +26,36 @@ order -- so an over-claiming room there is an over-claiming *backup*, and chargi
 of it made the model contradict its own availability estimate. Those pools are filled in depth order
 instead; see `Pool.queue`.
 
+**Even in a committee the members are not equally wrong.** "Everyone is a little high" was the second
+approximation, and it is measurably too crude: held out against 2021-2025, a receiver projected 2-4
+targets a game is over-projected by 17-21% while one projected 6-8 is over by 2-4%. A flat percentage
+therefore under-corrects the bench and over-corrects the starter, and does it in the one direction that
+matters, since the starter is the number anybody reads. So the residual is charged in proportion to
+`share ** pool_tilt` rather than to the share itself -- see `_tilt_alloc` for the arithmetic and
+`Settings.pool_tilt` for the exponent, which is fitted and whose value 1.0 is the flat rescale exactly.
+
+**A share somebody typed is held at what they typed.** With `Settings.lock_edited_shares` an explicit
+override is settled against the pool *first* and the residual is taken from the rest of the room. The
+alternative is what this replaced: a user setting a receiver to a 0.300 target share, the rescale
+quietly delivering 0.2545, and the provenance log reporting the edit applied at 0.300. The pool is
+still exactly whole -- somebody else pays -- which is the point of overriding one player and letting
+the room settle around him.
+
     python -m src.model.opportunity            # per-pool audit for 2026, before and after scaling
+    python -m src.model.backtest --fit-tilt    # refit the tilt exponent on held-out seasons
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
 import polars as pl
 
-from src.config import PROJ_SEASON, Settings
+from src.config import FITTED, PROJ_SEASON, Settings
 from src.data import history, lake
 from src.model import estimate, priors, roster, team
 
@@ -52,13 +69,16 @@ class Pool:
     partly claimed, since the QB's slice is fitted but the handoff's owner is folded into his overall
     carry share. Normalizing either kind would scale a number toward a total it was never measuring.
 
-    `queue` says *how* an exclusive pool is divided when the claims do not add up. The default is
-    proportional, which is right for a pool several men genuinely share: if a team's receivers claim
-    106% of its targets, the honest reading is that each of them is a little high. It is wrong for a
-    pool exactly one man can take. A dropback goes to one quarterback, and the depth chart is a strict
-    order, so a room that over-claims is a *backup* who is over-claiming -- and scaling proportionally
-    charges the starter for it. Under a queue the first-stringer is filled to his claim, the next man
-    gets only what is left, and the error lands where it belongs. See `_queue_alloc`.
+    `queue` says *how* an exclusive pool is divided when the claims do not add up. The default spreads
+    the disagreement across the room, which is right for a pool several men genuinely share: if a
+    team's receivers claim 106% of its targets, each of them is somewhat high. It is wrong for a pool
+    exactly one man can take. A dropback goes to one quarterback, and the depth chart is a strict
+    order, so a room that over-claims is a *backup* who is over-claiming -- and spreading it charges
+    the starter for it. Under a queue the first-stringer is filled to his claim, the next man gets only
+    what is left, and the error lands where it belongs. See `_queue_alloc`.
+
+    "Across the room" is not "equally": a committee's share estimates are more over-stated the smaller
+    they are, so the residual is weighted by `share ** Settings.pool_tilt`. See `_tilt_alloc`.
 
     A queued pool must be claimed by one position only; `tests/test_opportunity.py` asserts it, since
     the queue reads `depth_slot`, which is ranked within a position and not across the offence.
@@ -97,6 +117,25 @@ BY_POOL = {p.name: p for p in POOLS}
 
 # Every share metric any pool needs, plus the rates the composition layer asks for by name.
 SHARE_METRICS = tuple(dict.fromkeys(s for p in POOLS for s in p.shares))
+
+# The unit every pool is divided within: one team, in one game. Named because four functions have to
+# group by exactly the same thing and a pool that was summed over the wrong window is silently wrong.
+ROOM = ["game_id", "team"]
+
+# A boolean column named `lock_<share>` says this man's share was typed rather than estimated, and the
+# pool division holds it at what was typed. Written by `overrides.apply`; the prefix is shared with it
+# through this constant so neither side can drift.
+LOCK_PREFIX = "lock_"
+
+TILT_PATH = FITTED / "pool_tilt.json"
+
+
+@lru_cache(maxsize=1)
+def load_tilt() -> dict:
+    """The fitted tilt exponent. 1.0 when nothing has been fitted, which is the flat rescale."""
+    if not TILT_PATH.exists():
+        return {"pool_tilt": 1.0}
+    return json.loads(TILT_PATH.read_text(encoding="utf-8"))
 
 
 @lru_cache(maxsize=8)
@@ -196,8 +235,100 @@ def _queue_alloc(claim: pl.Expr, want: pl.Expr) -> pl.Expr:
     runs afterwards and lifts it to the target -- somebody has to throw the passes -- so the pool is
     conserved either way.
     """
-    ahead = claim.cum_sum().over(["game_id", "team"], order_by=["depth_slot", "player_id"]) - claim
+    ahead = claim.cum_sum().over(ROOM, order_by=["depth_slot", "player_id"]) - claim
     return pl.min_horizontal(claim, (want - ahead).clip(lower_bound=0.0))
+
+
+def _tilt_weight(claim: pl.Expr, p_play: pl.Expr, tilt: float) -> pl.Expr:
+    """How much of a room's disagreement each man is charged, before it is normalised.
+
+    The evidence is about a *share*, not about a claim: held-out error is measured per game played, so
+    what is over-stated by 20% is a bench receiver's 3 targets a game and not his 3-times-nine-games.
+    A man's claim is `share x p_play`, so undoing the availability and re-applying it linearly gives
+
+        weight = share ** tilt  x  p_play  =  claim ** tilt  x  p_play ** (1 - tilt)
+
+    which is the form used here because it makes the identity obvious: at `tilt = 1` the weight is the
+    claim itself and the whole allocation collapses to the flat rescale. Availability stays linear on
+    purpose -- a man who plays half a season can only be half as wrong about it, which is a counting
+    fact and not something the exponent should be allowed to bend.
+    """
+    if tilt == 1.0:
+        return claim
+    return claim.clip(lower_bound=0.0) ** tilt * p_play.clip(0.0, 1.0) ** (1.0 - tilt)
+
+
+def _tilt_alloc(claim: pl.Expr, weight: pl.Expr, want: pl.Expr) -> pl.Expr:
+    """Settle a room against the pool it divides, charging the disagreement by `weight`.
+
+        take_i  = min(claim_i, max(0, (Sigma claim - want) x weight_i / Sigma weight))
+        alloc_i = (claim_i - take_i) x want / Sigma (claim - take)
+
+    Three properties, all of them load-bearing and all of them pinned by `tests/test_opportunity.py`:
+
+    - **`weight = claim` is the flat rescale, exactly.** Then `take_i = claim_i x over / Sigma claim`
+      (the `min` never bites, because the overclaim is smaller than the claim), so the first line alone
+      leaves the room summing to `want` and the second is a factor of 1. That is why `pool_tilt = 1.0`
+      is the fallback rather than a value: it changes no number anywhere.
+    - **The pool comes out exact.** A tilted `take` can exceed a small claim -- charging a man 0.003 of
+      a pool he only claims 0.001 of -- and clipping it at his claim leaves the room short of paying.
+      The second line is what closes that gap, spread over whoever still has something, and it cannot
+      resurrect a man clipped to zero. One pass, no iteration, exact by construction.
+    - **An under-claiming room is scaled up, not tilted.** `over` is then negative, the clip takes
+      every `take` to zero, and the second line lifts the room proportionally: somebody has to catch
+      the passes, and there is no evidence about who deserves a share of a shortfall.
+    """
+    over = claim.sum().over(ROOM) - want
+    wsum = weight.sum().over(ROOM)
+    take = pl.min_horizontal(
+        claim,
+        pl.when(wsum > 1e-12).then(over * weight / wsum).otherwise(pl.lit(0.0)),
+    ).clip(lower_bound=0.0)
+    rest = claim - take
+    left = rest.sum().over(ROOM)
+    # a pool nobody has any claim left on is left alone rather than divided by zero
+    return pl.when(left > 1e-12).then(rest * want / left).otherwise(rest)
+
+
+def _settle(claim: pl.Expr, weight: pl.Expr, want: pl.Expr, locked: pl.Expr | None,
+            queue: bool) -> pl.Expr:
+    """One room's final claims: the locked ones at what was typed, the rest settled around them.
+
+    A lock is honoured out of the pool first, so the residual the others carry is `want` minus what the
+    locks took. That is the whole behaviour a user asked for by overriding one player: his number is
+    his number, and his teammates absorb it.
+
+    Locks are still not allowed to break the pool. A room whose *typed* shares alone claim more than
+    the pool holds cannot have all of them, so they are scaled against each other and the un-edited men
+    get nothing -- which is a projection of what was asked for, reported by the pool audit as a room
+    that sums to its target with nobody left in it, rather than a team throwing more passes than it was
+    projected to throw.
+    """
+    held = pl.lit(0.0) if locked is None else pl.when(locked).then(claim).otherwise(pl.lit(0.0))
+    held_sum = held.sum().over(ROOM)
+    free = claim if locked is None else pl.when(locked).then(pl.lit(0.0)).otherwise(claim)
+    free_w = weight if locked is None else pl.when(locked).then(pl.lit(0.0)).otherwise(weight)
+    left = (want - held_sum).clip(lower_bound=0.0)
+
+    if queue:
+        # the queue is itself the answer to who pays, so what follows it is a plain rescale: the room is
+        # filled in depth order against whatever the locks left, and the tilt has no business in a pool
+        # exactly one man can take
+        filled = _queue_alloc(free, left)
+        settled = _tilt_alloc(filled, filled, left)
+    else:
+        settled = _tilt_alloc(free, free_w, left)
+    if locked is None:
+        return settled
+    kept = pl.when(held_sum > want).then(want / held_sum).otherwise(pl.lit(1.0))
+    return pl.when(locked).then(claim * kept).otherwise(settled)
+
+
+def tilt_of(settings: Settings) -> float:
+    """The exponent in force: the scenario's if it set one, otherwise the fitted one, otherwise flat."""
+    if settings.pool_tilt is not None:
+        return float(settings.pool_tilt)
+    return float(load_tilt().get("pool_tilt", 1.0))
 
 
 def opportunity(
@@ -234,12 +365,16 @@ def opportunity(
     games = _game_frame(season, settings, rows, env)
 
     have = [s for s in SHARE_METRICS if s in shares.columns]
-    grid = ros.join(shares.select("player_id", *have), on="player_id", how="left").join(
+    # the lock markers ride along with the shares they belong to, so a share held at a typed value and
+    # the marker saying it was typed can never end up on different rows
+    marks = [f"{LOCK_PREFIX}{s}" for s in have if f"{LOCK_PREFIX}{s}" in shares.columns]
+    grid = ros.join(shares.select("player_id", *have, *marks), on="player_id", how="left").join(
         games, on=["season", "team"], how="inner"
     )
     if on_grid is not None:
         grid = on_grid(grid)
     targets = measure_targets() if pool_targets is None else pool_targets
+    tilt = tilt_of(settings)
 
     scaled = []
     for pool in POOLS:
@@ -247,28 +382,30 @@ def opportunity(
         team_col = f"team_{pool.team_col}"
         if not parts or team_col not in grid.columns:
             continue
-        raw_col, sum_col = f"raw_{pool.name}", f"sum_{pool.name}"
+        raw_col = f"raw_{pool.name}"
         raw = pl.sum_horizontal([pl.col(s).fill_null(0.0) for s in parts]) * pl.col("p_play")
         g = grid.with_columns(raw.alias(raw_col))
         want = pl.lit(targets.get(pool.name, 1.0))
         normalize = settings.normalize_pools and pool.exclusive
-        # a queue reallocates within the room before anything is scaled, so the scale factor below
-        # sees the claims as the depth chart leaves them
-        if normalize and pool.queue:
-            g = g.with_columns(_queue_alloc(pl.col(raw_col), want).alias(raw_col))
-        g = g.with_columns(pl.col(raw_col).sum().over(["game_id", "team"]).alias(sum_col))
-        # a pool nobody claims is left alone rather than divided by zero
-        factor = (
-            pl.when(pl.col(sum_col) > 1e-9)
-            .then(want / pl.col(sum_col))
-            .otherwise(pl.lit(1.0))
-        )
-        use = factor if normalize else pl.lit(1.0)
+        if normalize:
+            held = [f"{LOCK_PREFIX}{s}" for s in parts if f"{LOCK_PREFIX}{s}" in g.columns]
+            locked = (
+                pl.any_horizontal([pl.col(c).fill_null(False) for c in held])
+                if held and settings.lock_edited_shares else None
+            )
+            alloc = _settle(
+                pl.col(raw_col),
+                _tilt_weight(pl.col(raw_col), pl.col("p_play"), tilt),
+                want, locked, pool.queue,
+            )
+        else:
+            alloc = pl.col(raw_col)
+        g = g.with_columns(alloc.alias(raw_col))
         scaled.append(
             g.select(
                 "game_id", "player_id",
-                (pl.col(raw_col) * use).alias(f"share_{pool.name}"),
-                (pl.col(raw_col) * use * pl.col(team_col)).alias(pool.name),
+                pl.col(raw_col).alias(f"share_{pool.name}"),
+                (pl.col(raw_col) * pl.col(team_col)).alias(pool.name),
             )
         )
     # the shares are kept rather than dropped: they are the *input* to every count on the row, and a
@@ -310,6 +447,8 @@ def pool_audit(
             "count_per_game": float(per_team["count"].mean()),
             "normalized": bool(settings.normalize_pools and pool.exclusive),
             "queued": bool(pool.queue),
+            # 1.0 says the residual was spread flat; a queued pool ignores it either way
+            "tilt": 1.0 if pool.queue or not pool.exclusive else tilt_of(settings),
         })
     return pl.DataFrame(rows)
 
@@ -343,9 +482,11 @@ def team_pool_sums(
     a pool's raw sum is identical in all 17 games, which is why `opportunity` can take the factor from
     any one of them.
 
-    `factor` is the proportional correction the raw sum implies. For a `queued` pool that is the size
-    of the disagreement but not what is done about it: the room is filled in depth order instead, so
-    the whole correction lands on the last men in the queue rather than on every claimant.
+    `factor` is the *flat* correction the raw sum implies, which is the size of the disagreement rather
+    than what is done about it. A `queued` pool is filled in depth order instead, so the whole
+    correction lands on the last men in the queue; a committee charges the residual by
+    `share ** pool_tilt`, so a starter pays less than this factor and a bench player more. Read it as
+    "how far out is this room", not as anybody's multiplier.
     """
     settings = settings or Settings()
     part = roster.participation(season, settings, fitted=fitted) if part is None else part
@@ -398,7 +539,8 @@ def pool_report(
     return (
         raw.select("pool", "team_col", "exclusive", "measured_target",
                    "raw_mean", "raw_min", "raw_max")
-        .join(after.select("pool", "after_mean", "count_per_game", "normalized", "queued"), on="pool")
+        .join(after.select("pool", "after_mean", "count_per_game", "normalized", "queued", "tilt"),
+              on="pool")
         .with_columns(
             (100.0 * (pl.col("raw_mean") - pl.col("measured_target"))
              / pl.col("measured_target")).alias("gap_pct")

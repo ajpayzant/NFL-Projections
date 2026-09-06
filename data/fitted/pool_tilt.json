@@ -1,0 +1,27 @@
+{
+  "pool_tilt": 0.85,
+  "indifferent": true,
+  "reason": "held-out error is flat across the grid -- the best exponent (0.85) beats the flat rescale by 0.039%, inside the 0.2% margin -- so the exponent is not a measurement here; the mildest tilt in the grid is taken",
+  "rel": 0.9996107618255909,
+  "rel_points": 0.9996419630984245,
+  "seasons": [
+    2021,
+    2022,
+    2023,
+    2024,
+    2025
+  ],
+  "grid": {
+    "1": 1.0,
+    "0.85": 0.9996107618255909,
+    "0.7": 0.9996452372639182,
+    "0.55": 1.0003462216161396,
+    "0.4": 1.0017745655529224,
+    "0.25": 1.0031597941684598,
+    "0": 1.0032823298489295
+  },
+  "pools": [
+    "targets",
+    "carries"
+  ]
+}

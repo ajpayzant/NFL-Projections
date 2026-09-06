@@ -152,7 +152,9 @@ if sim is not None:
         ranges = ui.apply_filters(ranges, positions, teams, search)
     exports.add("ranges", ranges,
                 f"simulated season distribution, {sim.draws:,} draws — floors, ceilings, volatility")
-    exports.add("range_weekly", sim.weekly, "per-week boom and bust rates from the same simulation")
+    exports.add("range_weekly", sim.weekly,
+                "every player-week from the same simulation — floor, median, ceiling, boom and bust "
+                "for each Sunday rather than for the season")
 
 if skipped:
     st.warning("could not build: " + "; ".join(skipped), icon="⚠️")

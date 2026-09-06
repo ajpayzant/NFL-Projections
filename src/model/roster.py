@@ -36,10 +36,17 @@ fitted on a population that matches the one it is applied to:
   be the difference and depth slot is the only thing that says who, so this is measured directly:
   RB4 0.98, RB6 0.49, TE5 0.45, QB4 0.14. Without it the deep tail of a 90-man roster is projected as
   though every camp body survives the cut, which put team snap sums 13% over the identity.
-- `status_factor` -- the one stated assumption in the module. Only 20 of 2026's 915 offensive players
-  are anything but ACT, and the historical week-1 status column is missing entirely for 2017-2018 and
-  inconsistent elsewhere, so there is nothing honest to fit against. The multipliers live in
-  `Settings.status_availability` where a user can see and move them.
+- `status_factor` -- the one stated assumption in the module. The historical week-1 status column is
+  missing entirely for 2017-2018 and inconsistent elsewhere, so there is nothing honest to fit against;
+  the multipliers live in `Settings.status_availability` where a user can see and move them.
+
+  This factor was near-inert in August and is not any more, which is worth knowing before reading a
+  number that depends on it. A camp snapshot is 90-man and almost entirely ACT -- 20 of 915 offensive
+  players were anything else. A settled September snapshot is the post-cuts population, and it carries
+  everyone the team let go: 502 ACT, 209 CUT, 182 practice-squad DEV, 60 RES. That is not a worse file,
+  it is the *same* population the availability fit was built on -- the 2023-2025 week-1 snapshots run
+  441/172/171/82, 450/219/187/60 and 451/190/180/65 -- so the fit and the roster it is applied to agree
+  now in a way they did not in August. What changed is how much of the answer these multipliers carry.
 
 **Rookies get draft capital as a relative statement, not an absolute one.** A rookie has no history,
 so his prior is the whole projection, and the two obvious answers are both marginals of the same
@@ -67,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Container
 from datetime import UTC, date, datetime
 from functools import lru_cache
 
@@ -141,6 +149,36 @@ def _draft() -> pl.DataFrame:
     )
 
 
+@lru_cache(maxsize=1)
+def _draft_numbers() -> pl.DataFrame:
+    """player_id -> draft pick, from every roster snapshot in the lake that still carries the column.
+
+    A player's draft position never changes, so any season's snapshot answers for him and the newest
+    one is not privileged. Worth the extra read because `draft_picks` only reaches back to 2016, and the
+    roster column is what prices the veterans drafted before that -- twenty of the 2026 offence, who are
+    otherwise indistinguishable from undrafted the moment upstream stops shipping it, as it just did.
+
+    Returns an empty frame rather than raising: a missing draft pick costs one prior, and by the time
+    this is reached the roster itself has already been read successfully.
+    """
+    frames = []
+    for dataset in ("rosters", "rosters_weekly"):
+        try:
+            df = lake.read(dataset, layer="raw")
+        except FileNotFoundError:
+            continue
+        if {"gsis_id", "draft_number"} <= set(df.columns):
+            frames.append(df.select("gsis_id", "draft_number"))
+    if not frames:
+        return pl.DataFrame(schema={"player_id": pl.String, "draft_number_ros": pl.Int32})
+    return (
+        pl.concat(frames)
+        .filter(pl.col("gsis_id").is_not_null() & pl.col("draft_number").is_not_null())
+        .group_by(pl.col("gsis_id").alias("player_id"))
+        .agg(pl.col("draft_number").cast(pl.Int32, strict=False).min().alias("draft_number_ros"))
+    )
+
+
 @lru_cache(maxsize=8)
 def _games_by_team(seasons: tuple[int, ...]) -> pl.DataFrame:
     """Games a player actually played, per season *and team*.
@@ -212,6 +250,18 @@ def _age(season: int) -> pl.Expr:
 # than a small league, and taking it at face value would project a season off forty players.
 MIN_SNAPSHOT_ROWS = 1000
 
+# The four columns without which a roster row means nothing: no identifier, no position, no team or no
+# name and there is no player to project. Everything else upstream ships is optional, and treated that
+# way on purpose -- the 2026 snapshot silently stopped carrying `draft_number` mid-season, and a hard
+# `pl.col` reference to it turned a missing column into a ColumnNotFoundError that took the whole app
+# down on load. A column that disappears should cost the estimate it feeds, not the session.
+REQUIRED_ROSTER_COLUMNS = ("gsis_id", "position", "team", "full_name")
+
+
+def _opt(columns: Container[str], name: str, dtype: pl.DataType = pl.String) -> pl.Expr:
+    """`name` if the snapshot carries it, an all-null column of `dtype` if it does not."""
+    return pl.col(name) if name in columns else pl.lit(None, dtype).alias(name)
+
 
 def _week1_rows(season: int) -> pl.DataFrame:
     """The earliest full league-wide roster snapshot of `season`.
@@ -233,8 +283,9 @@ def _week1_rows(season: int) -> pl.DataFrame:
             df = df.filter(pl.col("game_type") == "REG")
         if "week" in df.columns:
             df = df.filter(pl.col("week") == pl.col("week").min())
-        tried.append(f"{dataset}={df.height}")
-        if df.height >= MIN_SNAPSHOT_ROWS:
+        missing = [c for c in REQUIRED_ROSTER_COLUMNS if c not in df.columns]
+        tried.append(f"{dataset}={df.height}" + (f" (no {', '.join(missing)})" if missing else ""))
+        if df.height >= MIN_SNAPSHOT_ROWS and not missing:
             return df
     raise FileNotFoundError(
         f"no league-wide week-1 roster snapshot for {season} (found {', '.join(tried) or 'nothing'})"
@@ -250,6 +301,7 @@ def roster(season: int = PROJ_SEASON, when: str = "latest") -> pl.DataFrame:
     fresher of the two and is the one that decides who is actually on the team.
     """
     ros = _week1_rows(season)
+    have = set(ros.columns)
     ros = (
         ros.filter(pl.col("gsis_id").is_not_null() & pl.col("position").is_in(OFFENSE_POSITIONS))
         .select(
@@ -259,18 +311,25 @@ def roster(season: int = PROJ_SEASON, when: str = "latest") -> pl.DataFrame:
             pl.col("full_name").alias("player"),
             pl.col("position").replace({"FB": "RB"}).alias("position"),
             pl.col("position").alias("roster_position"),
-            pl.col("status"),
-            pl.col("years_exp").cast(pl.Int32, strict=False).alias("years_exp"),
-            pl.col("rookie_year").cast(pl.Int32, strict=False).alias("rookie_year"),
-            pl.col("draft_number").cast(pl.Int32, strict=False).alias("draft_number"),
-            pl.col("jersey_number").cast(pl.Int32, strict=False).alias("jersey"),
-            _age(season),
-            pl.col("height").cast(pl.Float64, strict=False).alias("height"),
-            pl.col("weight").cast(pl.Float64, strict=False).alias("weight"),
+            _opt(have, "status"),
+            _opt(have, "years_exp").cast(pl.Int32, strict=False).alias("years_exp"),
+            _opt(have, "rookie_year").cast(pl.Int32, strict=False).alias("rookie_year"),
+            _opt(have, "draft_number").cast(pl.Int32, strict=False).alias("draft_number"),
+            _opt(have, "jersey_number").cast(pl.Int32, strict=False).alias("jersey"),
+            _age(season) if "birth_date" in have else pl.lit(None, pl.Float64).alias("age"),
+            _opt(have, "height").cast(pl.Float64, strict=False).alias("height"),
+            _opt(have, "weight").cast(pl.Float64, strict=False).alias("weight"),
         )
         .sort(["player_id", "team"])
         .unique(subset=["player_id"], keep="first")
     )
+    # Neither `unique` nor `join` promises to preserve row order, so the final sort is what makes this
+    # frame reproducible. It is not cosmetic: the opportunity stage divides pools in the order it is
+    # handed the players, so an unstable order here moved league carries by ~0.2% between two runs of
+    # the *same* scenario -- enough to hide a real edit inside run-to-run noise.
+    ros = ros.join(_draft_numbers(), on="player_id", how="left").with_columns(
+        pl.coalesce("draft_number", "draft_number_ros").alias("draft_number")
+    ).drop("draft_number_ros").sort("player_id")
 
     chart = depth.depth_chart(season, when)
     listed = (

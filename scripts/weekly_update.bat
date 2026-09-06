@@ -12,6 +12,10 @@ setlocal
 cd /d "%~dp0.."
 REM quoted on purpose: `set PYTHONUTF8=1 ` with a trailing space is a *fatal* CPython preconfig error
 set "PYTHONUTF8=1"
+REM Same single polars worker as run_app.bat, for the same reason: the multi-threaded pool faults on a
+REM NULL deref inside the native runtime. A scheduled task that dies that way just logs a failure and
+REM leaves the data stale, which is quieter and therefore worse.
+set "POLARS_MAX_THREADS=1"
 
 if not exist ".venv\Scripts\python.exe" (
   echo Cannot find .venv\Scripts\python.exe -- create the venv first.

@@ -64,6 +64,42 @@ def test_a_reset_takes_one_knob_and_leaves_the_rest() -> None:
     assert sc.clear().items == ()
 
 
+def test_un_overriding_a_group_of_players_takes_all_of_their_edits_and_nobody_else_s() -> None:
+    """The other end of a bulk edit. Overriding selectively is only usable if un-overriding is too."""
+    sc = Scenario().set(
+        Override("player", "p1", "target_share", "set", 0.30),
+        Override("player", "p1", "target_share", "set", 0.25, week=4),
+        Override("player", "p1", "catch_rate", "set", 0.70),
+        Override("player", "p2", "target_share", "set", 0.10),
+        Override("player", "p3", "carry_share", "set", 0.40),
+        Override("team", "PHI", "targets", "multiply", 1.1),
+    )
+    left = sc.clear_keys("player", ["p1", "p3"])
+    assert {(o.level, o.key) for o in left.items} == {("player", "p2"), ("team", "PHI")}
+    # a team of the same name is a different key: the level is part of the question
+    assert sc.clear_keys("team", ["p1"]).items == sc.items
+
+
+def test_un_overriding_nobody_leaves_the_scenario_identical() -> None:
+    """No new `updated`, so the digest does not move and the app recomputes nothing."""
+    sc = Scenario().set(Override("player", "p1", "target_share", "set", 0.30))
+    assert sc.clear_keys("player", []) is sc
+    assert sc.clear_keys("player", ["someone_else"]) is sc
+
+
+def test_the_edit_count_per_player_is_what_a_drop_all_button_promises() -> None:
+    sc = Scenario().set(
+        Override("player", "p1", "target_share", "set", 0.30),
+        Override("player", "p1", "target_share", "set", 0.25, week=4),
+        Override("player", "p2", "target_share", "set", 0.10),
+        Override("team", "PHI", "targets", "multiply", 1.1),
+    )
+    assert sc.counts("player") == {"p1": 2, "p2": 1}
+    assert sc.counts("team") == {"PHI": 1}
+    for key, n in sc.counts("player").items():
+        assert len(sc.clear_keys("player", [key]).items) == len(sc.items) - n
+
+
 def test_a_scenario_survives_a_round_trip_through_json() -> None:
     sc = Scenario(name="mine").set(
         Override("player", "p1", "target_share", "set", 0.30, base=0.24, note="alpha"),

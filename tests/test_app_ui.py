@@ -949,3 +949,44 @@ def test_the_stamp_is_read_fresh_every_time_rather_than_cached(tmp_path, monkeyp
     assert ui.last_update()["mode"] == "light"
     stamp.write_text('{"finished": "2026-09-09T04:12:00", "mode": "full"}', encoding="utf-8")
     assert ui.last_update()["mode"] == "full"
+
+
+# --------------------------------------------------------------------------- #
+# taking an override back off
+# --------------------------------------------------------------------------- #
+# `drop_all` is one line over `Scenario.clear_keys`, and the line is the part worth pinning: it goes
+# through `set_live`, so the drop is autosaved exactly like the edit was. A drop that only lived in
+# session state would come back on the next browser reload, which is the one failure mode a user would
+# read as the tool ignoring them.
+def test_dropping_a_player_takes_every_edit_on_him_and_reports_how_many() -> None:
+    ui.edit(
+        Override("player", "p1", "target_share", "set", 0.30),
+        Override("player", "p1", "target_share", "set", 0.25, week=4),
+        Override("player", "p1", "catch_rate", "set", 0.70),
+        Override("player", "p2", "target_share", "set", 0.10),
+    )
+    assert ui.drop_all("player", "p1") == 3
+    assert {o.key for o in ui.live().items} == {"p2"}
+
+
+def test_dropping_several_at_once_is_one_write() -> None:
+    ui.edit(Override("player", "p1", "target_share", "set", 0.30),
+            Override("player", "p2", "target_share", "set", 0.10),
+            Override("team", "PHI", "targets", "multiply", 1.1))
+    assert ui.drop_all("player", "p1", "p2") == 2
+    assert [(o.level, o.key) for o in ui.live().items] == [("team", "PHI")]
+
+
+def test_dropping_nobody_writes_nothing() -> None:
+    ui.edit(Override("player", "p1", "target_share", "set", 0.30))
+    was = ui.live()
+    assert ui.drop_all("player", "p9") == 0
+    assert ui.live() is was
+
+
+def test_a_dropped_player_is_gone_from_the_file_and_not_only_from_the_session() -> None:
+    """Autosave is the funnel, so the scenario on disk has to agree with the one on screen."""
+    ui.edit(Override("player", "p1", "target_share", "set", 0.30),
+            Override("player", "p2", "target_share", "set", 0.10))
+    ui.drop_all("player", "p1")
+    assert {o.key for o in overrides.load(ui.live().name).items} == {"p2"}

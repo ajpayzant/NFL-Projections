@@ -34,10 +34,17 @@ recorded against, the value it actually found when it ran, and the value it prod
 longer exists is reported as unapplied rather than silently dropped, because a scenario written in
 August should say so in November instead of quietly meaning nothing.
 
-**Overriding a share does not exempt it from the pool.** Push a receiver to a 30% target share with
-normalisation on and his teammates are scaled down to keep the team's targets whole -- which is the
-point of the pool, and visible in the audit on the team page. With it off he simply gets 30% of a
-team that now throws more than it was projected to. Both are defensible; neither is silent.
+**An overridden share is held, and the pool is still whole.** Push a receiver to a 30% target share
+and he gets 30%: the edit is settled against the pool before the room is, and his teammates absorb it,
+so the team's targets still add up to the targets it is projected to throw. This is `lock_edited_shares`
+and it is on by default because the alternative was the worst of the three readings -- the rescale
+quietly delivered 0.2545, and the provenance log below reported the edit applied at 0.300. Turn it off
+and a typed share is rescaled with everything else; turn normalisation off and he gets 30% of a team
+that now throws more than it was projected to. All three are defensible; none of them is silent.
+
+The point of holding it is what a user does next: override the players who matter, leave the rest
+alone, and let the room settle around them. Un-edited teammates are the ones who move, and they do not
+all move by the same percentage -- see `opportunity._tilt_alloc`.
 
     python -m src.model.overrides --demo        # what one team edit and one player edit do
 """
@@ -47,6 +54,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
+import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,9 +79,9 @@ MODES = ("set", "multiply")
 
 # Settings fields a scenario is allowed to patch. Not every field: `status_availability` is a stated
 # assumption rather than a knob, and `simulation_draws` belongs to the simulation.
-LEAGUE_FIELDS = ("normalize_pools", "use_context_factors", "market_weight", "schedule_renormalise",
-                 "context_k", "team_weight_recent", "team_keep_vs_mean", "games_projected",
-                 "tier_size", "recency")
+LEAGUE_FIELDS = ("normalize_pools", "pool_tilt", "lock_edited_shares", "use_context_factors",
+                 "market_weight", "schedule_renormalise", "context_k", "team_weight_recent",
+                 "team_keep_vs_mean", "games_projected", "tier_size", "recency")
 
 # Per-game team numbers worth editing: the pools the players divide, and the rates their efficiency
 # is scaled by. Deliberately not every column in the environment -- editing `points` alone would move
@@ -124,6 +135,13 @@ GAME_RATE_FIELDS = efficiency.RATE_METRICS
 
 # Everything a week can be attached to. A player field outside this set is one number for the season.
 GAME_ALL_FIELDS = tuple(dict.fromkeys(GAME_FIELDS + GAME_RATE_FIELDS))
+
+# The fields an edit can be *held* at, rather than merely written. A share is the only kind, because it
+# is the only kind a later stage rewrites: the pool division rescales a room to the pool it divides, so
+# without a marker the number a user typed is not the number the projection uses. `p_play` is not here
+# even though it is edited on the same frame -- it multiplies a claim rather than being one, so it is
+# never rescaled and there is nothing to hold it against. Nor is a rate: nothing renormalises rates.
+LOCKABLE = frozenset(opportunity.SHARE_METRICS)
 FIELDS = {"league": LEAGUE_FIELDS, "team": TEAM_FIELDS,
           "player": PLAYER_FIELDS + DEPTH_FIELDS + ROSTER_FIELDS + GAME_ONLY_FIELDS}
 
@@ -265,6 +283,31 @@ class Scenario:
             )
         return replace(self, items=tuple(o for o in self.items if keep(o)), updated=_now())
 
+    def clear_keys(self, level: str, keys: Iterable[str]) -> Scenario:
+        """Drop every edit on a set of players or teams at once. The other half of holding an edit.
+
+        `lock_edited_shares` makes an override mean what it says, which is what makes "override the ten
+        players you have an opinion about and let the room settle around them" a workable way to use the
+        tool -- but only if the eleventh is as easy to *un*-override. One `clear` per key would do it and
+        would rebuild the tuple once per key and stamp `updated` each time; this is one pass, because the
+        realistic call is a scenario with two thousand edits and a multiselect of thirty players.
+        """
+        drop = set(keys)
+        if not drop:
+            return self
+        kept = tuple(o for o in self.items if not (o.level == level and o.key in drop))
+        if len(kept) == len(self.items):
+            return self                  # nothing matched: no new digest, so nothing recomputes
+        return replace(self, items=kept, updated=_now())
+
+    def counts(self, level: str) -> dict[str, int]:
+        """How many edits sit on each player or team, for a chooser that has to say "drop all 7"."""
+        out: dict[str, int] = {}
+        for o in self.items:
+            if o.level == level:
+                out[o.key] = out.get(o.key, 0) + 1
+        return out
+
     def rename(self, name: str) -> Scenario:
         """A new name and nothing else. The digest is unchanged, so a rename costs no recomputation."""
         return replace(self, name=name or BASELINE)
@@ -383,12 +426,63 @@ def summaries() -> list[dict[str, Any]]:
     return out
 
 
+# How many previous versions of each scenario to keep. A thousand hand edits is weeks of judgement and
+# the only copy of it is one file that every keystroke overwrites, so the cost of a few hundred KB is
+# not worth thinking about against the cost of losing it.
+BACKUPS_KEEP = 30
+
+
+def backups_dir() -> Path:
+    """Where superseded versions go. A subdirectory because `names()` globs `SCENARIOS` flat, so
+    nothing in here can ever be offered as a scenario to load."""
+    return SCENARIOS / "_backups"
+
+
+def backups(name: str) -> list[Path]:
+    """Every kept version of `name`, oldest first. The last one is what the current file replaced."""
+    d = backups_dir()
+    return sorted(d.glob(f"{path(name).stem}.*.json")) if d.is_dir() else []
+
+
+def _keep_previous(p: Path) -> None:
+    """Copy the file `save` is about to overwrite into `_backups/`, and prune to `BACKUPS_KEEP`.
+
+    Autosave means every edit overwrites the scenario, which is right -- it is why a crash costs
+    nothing. What it does not protect against is a *wrong* edit, or a Reset saved over good work and
+    noticed an hour later, and for that the only answer is the previous versions.
+    """
+    if not p.is_file():
+        return
+    try:
+        d = backups_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        # sorts chronologically as text, which is what `backups` relies on
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+        shutil.copy2(p, d / f"{p.stem}.{stamp}.json")
+        stale = sorted(d.glob(f"{p.stem}.*.json"))[:-BACKUPS_KEEP]
+        for old in stale:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass                # a backup that cannot be written must not stop the save it was protecting
+
+
 def save(scenario: Scenario) -> Path:
+    """Write the scenario, atomically, keeping the version it replaces.
+
+    Atomically because autosave fires on every edit and the app is killed by everything from a lost
+    server connection to a closed laptop. A plain `write_text` that is interrupted leaves a truncated
+    file, and a truncated scenario is not a partial loss of the work -- `json.loads` fails on it and the
+    whole thing is unreadable. Writing a sibling and renaming it makes the swap one step, so the file
+    under the scenario's name is always either the last complete version or this one.
+    """
     ensure_dirs()
     now = _now()
     sc = replace(scenario, created=scenario.created or now, updated=now)
     p = path(sc.name)
-    p.write_text(sc.to_json(), encoding="utf-8")
+    _keep_previous(p)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(sc.to_json(), encoding="utf-8")
+    os.replace(tmp, p)
     remember(sc.name)
     return p
 
@@ -475,8 +569,15 @@ def _record(o: Override) -> dict:
             "base_now": None, "used_now": None, "rows": 0, "applied": False, "reason": ""}
 
 
-def _one(frame: pl.DataFrame, o: Override, key_col: str, week_col: str | None) -> tuple[pl.DataFrame, dict]:
-    """Apply a single edit and report what it did, including when it did nothing."""
+def _one(frame: pl.DataFrame, o: Override, key_col: str, week_col: str | None,
+         lock: bool = False) -> tuple[pl.DataFrame, dict]:
+    """Apply a single edit and report what it did, including when it did nothing.
+
+    `lock` marks the rows it touched in a `lock_<field>` column, for the one class of field where a
+    later stage would otherwise overwrite the edit: a share, which the pool division rescales. Only
+    a share is markable -- see `LOCKABLE` -- and only an edit that actually landed is marked, so a
+    scenario naming a player who is no longer on a roster cannot reserve him a slice of a pool.
+    """
     record = _record(o)
     if o.field not in frame.columns:
         record["reason"] = "no such column in this frame"
@@ -504,6 +605,10 @@ def _one(frame: pl.DataFrame, o: Override, key_col: str, week_col: str | None) -
     col = pl.col(o.field).cast(pl.Float64)
     new = pl.lit(float(o.value)) if o.mode == "set" else col * float(o.value)
     out = frame.with_columns(pl.when(mask).then(new).otherwise(col).alias(o.field))
+    if lock and o.field in LOCKABLE:
+        mark = f"{opportunity.LOCK_PREFIX}{o.field}"
+        already = pl.col(mark).fill_null(False) if mark in out.columns else pl.lit(False)
+        out = out.with_columns(pl.when(mask).then(pl.lit(True)).otherwise(already).alias(mark))
     record.update(
         base_now=float(was),
         used_now=float(out.filter(mask)[o.field].mean()),
@@ -521,11 +626,15 @@ def apply(
     week_col: str | None = None,
     fields: tuple[str, ...] | None = None,
     weeks: str = "any",
+    lock: bool = False,
 ) -> tuple[pl.DataFrame, list[dict]]:
     """Every edit at `level` whose field is in this frame, applied in the order they were made.
 
     `fields` narrows it further, which is how the same player edit lands on the frame that owns it:
     availability on the participation frame, shares on the share frame, rates on the rate frame.
+
+    `lock` carries a marker forward for each share edited, so the pool division can hold it at the
+    typed value instead of rescaling it with everything else. See `_one` and `opportunity._settle`.
 
     `weeks` says which edits a stage owns -- `"any"`, `"only"` the ones carrying a week, or `"never"`
     those. A player's share is one number for the season and his share in week 5 is a different edit on
@@ -542,7 +651,7 @@ def apply(
             continue
         if (weeks == "only" and o.week is None) or (weeks == "never" and o.week is not None):
             continue
-        out, record = _one(out, o, key_col, week_col)
+        out, record = _one(out, o, key_col, week_col, lock=lock)
         log.append(record)
     return out, log
 
@@ -849,7 +958,7 @@ def run(
 
     shares = opportunity.player_shares(season, st, ros=ros, fitted=fitted)
     shares, rec = apply(shares, sc, "player", "player_id", fields=opportunity.SHARE_METRICS,
-                        weeks="never")
+                        weeks="never", lock=st.lock_edited_shares)
     note("shares", rec)
 
     rates = efficiency.rates(season, st, ros=ros, fitted=fitted)
@@ -864,7 +973,7 @@ def run(
     def one_game(grid: pl.DataFrame) -> pl.DataFrame:
         """The per-game player edits, inside the pool division rather than after it."""
         edited, records = apply(grid, sc, "player", "player_id", week_col="week",
-                                fields=GAME_FIELDS, weeks="only")
+                                fields=GAME_FIELDS, weeks="only", lock=st.lock_edited_shares)
         note("game", records)
         return edited
 
@@ -996,10 +1105,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scenario", help="a saved scenario name")
     p.add_argument("--demo", action="store_true", help="one edit of each kind")
     p.add_argument("--list", action="store_true", help="the scenarios on disk")
+    p.add_argument("--backups", metavar="NAME",
+                   help="kept versions of NAME, oldest first, with their edit counts")
+    p.add_argument("--restore", metavar="FILE",
+                   help="put a kept version back under its scenario's name (the app must be restarted)")
     a = p.parse_args(argv)
     if a.list:
         for name in names() or ["(none saved)"]:
             print(name)
+        return 0
+    if a.backups:
+        for b in backups(a.backups) or []:
+            try:
+                d = json.loads(b.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            print(f"  {len(d.get('overrides') or ()):>5} edits  {d.get('updated') or '':<32} {b}")
+        print(f"  {'(none kept)' if not backups(a.backups) else ''}"
+              f"  current: {path(a.backups)}")
+        return 0
+    if a.restore:
+        src = Path(a.restore)
+        if not src.is_file():
+            print(f"no such file: {src}", file=sys.stderr)
+            return 2
+        sc = Scenario.from_json(src.read_text(encoding="utf-8"))
+        print(f"restored {len(sc.items)} edits to {save(sc)}")
         return 0
     _report(a.season, None if a.demo or not a.scenario else load(a.scenario))
     return 0

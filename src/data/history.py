@@ -256,10 +256,16 @@ def skill_seasons(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
         "team_two_minute_dropbacks", "team_plays", "team_receiving_yards", "team_rushing_yards",
     ]
     have = [c for c in counts if c in sw.columns]
+    # `mode()` returns every value tied for most weeks and does not promise an order, so the `.sort()`
+    # before `.first()` is what makes the tie-break reproducible. Without it a player traded at the
+    # midpoint of a season -- an even split, so a genuine tie -- was assigned to either of his two teams
+    # depending on the run: 14 of these 5,333 player-seasons flipped between two processes, which moved
+    # `measure_targets`' per-team denominators and with them every projected pool by up to 0.2%. The
+    # season's counts were never in doubt, only which team-season bucket they landed in.
     agg = sw.group_by(["player_id", "season"]).agg(
-        pl.col("player_name").drop_nulls().mode().first().alias("player"),
-        pl.col("position").drop_nulls().mode().first().alias("position"),
-        pl.col("team").drop_nulls().mode().first().alias("team"),
+        pl.col("player_name").drop_nulls().mode().sort().first().alias("player"),
+        pl.col("position").drop_nulls().mode().sort().first().alias("position"),
+        pl.col("team").drop_nulls().mode().sort().first().alias("team"),
         pl.col("game_id").n_unique().alias("games"),
         *[pl.col(c).sum().alias(c) for c in have],
     )
@@ -341,8 +347,8 @@ def qb_seasons(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
     ]
     have = [c for c in counts if c in qw.columns]
     agg = qw.group_by(["player_id", "season"]).agg(
-        pl.col("player_name").drop_nulls().mode().first().alias("player"),
-        pl.col("team").drop_nulls().mode().first().alias("team"),
+        pl.col("player_name").drop_nulls().mode().sort().first().alias("player"),
+        pl.col("team").drop_nulls().mode().sort().first().alias("team"),
         pl.col("game_id").n_unique().alias("games"),
         *[pl.col(c).sum().alias(c) for c in have],
     )
@@ -390,7 +396,7 @@ def player_seasons(seasons: tuple[int, ...], scoring: Scoring | None = None) -> 
     return pg.group_by(["season", "player_id"]).agg(
         pl.col("player_name").drop_nulls().first().alias("player"),
         pl.col("position").drop_nulls().first().alias("position"),
-        pl.col("team").drop_nulls().mode().first().alias("team"),
+        pl.col("team").drop_nulls().mode().sort().first().alias("team"),
         pl.len().cast(pl.Float64).alias("games"),
         *[pl.col(c).cast(pl.Float64).fill_null(0.0).sum().alias(c) for c in have],
     )
@@ -545,16 +551,16 @@ def injury_report(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
         return iw
     weeks_where = lambda cond: pl.col("week").filter(cond).n_unique()  # noqa: E731
     return iw.group_by(["player_id", "season"]).agg(
-        pl.col("player").drop_nulls().mode().first().alias("player"),
-        pl.col("team").drop_nulls().mode().first().alias("team"),
-        pl.col("position").drop_nulls().mode().first().alias("position"),
+        pl.col("player").drop_nulls().mode().sort().first().alias("player"),
+        pl.col("team").drop_nulls().mode().sort().first().alias("team"),
+        pl.col("position").drop_nulls().mode().sort().first().alias("position"),
         pl.col("week").n_unique().alias("weeks_listed"),
         weeks_where(pl.col("status") == "Out").alias("weeks_out"),
         weeks_where(pl.col("status") == "Doubtful").alias("weeks_doubtful"),
         weeks_where(pl.col("status") == "Questionable").alias("weeks_questionable"),
         weeks_where(pl.col("practice") == "DNP").alias("weeks_dnp"),
         weeks_where(pl.col("practice") == "limited").alias("weeks_limited"),
-        pl.col("injury").drop_nulls().mode().first().alias("main_injury"),
+        pl.col("injury").drop_nulls().mode().sort().first().alias("main_injury"),
         pl.col("injury").n_unique().alias("distinct_injuries"),
     ).sort(["player_id", "season"])
 

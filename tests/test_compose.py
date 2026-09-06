@@ -384,6 +384,27 @@ def test_a_move_needs_a_previous_team_to_have_moved_from(brd):
     assert (moved["last_team"] != moved["team"]).all()
 
 
+def test_the_healthy_case_is_the_same_projection_over_seventeen_games(brd):
+    """The column that separates a durability discount from a low opinion.
+
+    Every total on the board is availability-weighted, so a man at 14 expected games sits under his own
+    career line by three games' worth of production and reads as a downgrade. `if_healthy` is his rate
+    over a full slate, so it is at or above the projection for everybody and equal to it only for the
+    player nobody expects to miss a Sunday.
+    """
+    assert (brd["if_healthy"] >= brd["fantasy_points"] - 1e-6).all()
+    # the gap is the missed games and nothing else: the ratio is seventeen over his expected games, so a
+    # man nobody expects to miss a Sunday has no gap at all
+    played = brd.filter(pl.col("games") > 0.1)
+    ratio = played["if_healthy"] / played["fantasy_points"]
+    assert (ratio - 17.0 / played["games"]).abs().max() < 1e-6
+    fragile = brd.filter((pl.col("games") < 15.0) & (pl.col("fantasy_points") > 50.0))
+    assert fragile.height > 0
+    assert (fragile["if_healthy"] > fragile["fantasy_points"] + 1.0).all()
+    # and it is the per-game figure times seventeen rather than anything re-derived
+    assert (brd["if_healthy"] - brd["points_per_game"] * 17.0).abs().max() < 1e-6
+
+
 def test_a_board_without_a_previous_season_still_ranks(yr, settings):
     """The comparison columns are optional; the ranking is not."""
     bare = compose.board(yr, settings)

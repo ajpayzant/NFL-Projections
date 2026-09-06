@@ -174,6 +174,45 @@ def interactions(sc: Scenario) -> int:
         else:
             print(f"  ok    one knob reset, {len(left.items)} edits left, digest {left.digest}")
 
+    # The other end of it: the whole player, from the multiselect rather than from the ledger. Driven
+    # here rather than trusted because a control that writes an empty selection would read as a working
+    # button and quietly do nothing -- and because dropping a *group* is the one action on this page that
+    # takes more than one edit away at a time.
+    at = run_page(EDITS, sc)
+    picker = [m for m in at.multiselect if (m.key or "") == "edits:unoverride"]
+    if not picker:
+        bad += 1
+        print("  FAIL  Edits: no un-override picker rendered")
+    else:
+        # `options` on an AppTest multiselect are the *formatted* labels, so the man is chosen the way a
+        # reader chooses him -- the one row that is not a team, named and counted
+        who = [o for o in picker[0].options if " · team — " not in o]
+        if not who:
+            bad += 1
+            print(f"  FAIL  Edits: the un-override picker offers nobody: {picker[0].options}")
+        else:
+            at = picker[0].select(who[0]).run()
+            go = [b for b in at.button if (b.key or "").startswith("edits:unoverride:go")]
+            if not go:
+                bad += 1
+                print("  FAIL  Edits: no un-override button beside the picker")
+            else:
+                had = int(who[0].rsplit("— ", 1)[1].split()[0])
+                on_players = len([o for o in sc.items if o.level == "player"])
+                left = go[0].click().run().session_state[LIVE]
+                now = len([o for o in left.items if o.level == "player"])
+                teams_before = len([o for o in sc.items if o.level == "team"])
+                teams_now = len([o for o in left.items if o.level == "team"])
+                if now != on_players - had:
+                    bad += 1
+                    print(f"  FAIL  un-override took {on_players - now} player edits, not {had}")
+                elif teams_now != teams_before:
+                    bad += 1
+                    print(f"  FAIL  un-override took {teams_before - teams_now} team edits with it")
+                else:
+                    print(f"  ok    un-override took all {had} edits on {who[0].split(' ·')[0]}, "
+                          f"{len(left.items)} left elsewhere")
+
     # Both scopes of a team edit are on the Team page now, and the season-wide one is behind a scope
     # radio -- so the radio is driven rather than assumed, because a knob nobody can reach is the same
     # failure as a knob that does not write.
@@ -281,9 +320,13 @@ def ranges() -> int:
 
     The draws are wound down to the smallest option first: this is checking that the wiring produces a
     floor and a ceiling, and ten thousand seasons would prove exactly the same thing far more slowly.
+
+    The week page is in here because its range is a different reading rather than the same one per game:
+    a startable player's honest fifth percentile for one Sunday is zero, so the page has to show the
+    chance of nothing and the floor of the weeks he plays, and that pair is what is looked for.
     """
     bad = 0
-    for page in (HOME, PLAYER):
+    for page in (HOME, PLAYER, WEEKLY):
         at = run_page(page)
         toggles = [t for t in at.toggle if (t.key or "").endswith(":on")]
         if not toggles:
@@ -302,7 +345,8 @@ def ranges() -> int:
             continue
         # the floor is a drawn tile on the player page and a column on the board, so both are read out
         # of everything on screen rather than out of `st.metric` alone
-        want = ("floor · P5" if "Player" in page else "volatility")
+        want = ("floor · P5" if "Player" in page else
+                "floor if he plays" if "Week" in page else "volatility")
         if want not in screen(at):
             bad += 1
             print(f"  FAIL  {page}: ranges on but no {want!r} on screen")

@@ -16,8 +16,10 @@ shared copy. Nothing here touches `processed/`.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import polars as pl
 
@@ -50,11 +52,50 @@ def fetch(dataset: str, season: int) -> pl.DataFrame:
     return df.filter(pl.col("season") == season)
 
 
-def write(dataset: str, season: int, df: pl.DataFrame) -> int:
+def dropped_columns(target: Path, df: pl.DataFrame) -> list[str]:
+    """Columns the file at `target` has that the replacement does not.
+
+    Upstream reshapes without warning: the 2026 season roster arrived for months with `draft_number`
+    and then stopped, and the refresh wrote the narrower file over the wider one without a word.
+    Everything downstream is written to survive that now, but a column vanishing is still a change in
+    what can be projected, and it belongs in the log rather than in a traceback a week later.
+    """
+    if not target.is_file():
+        return []
+    try:
+        before = set(pl.read_parquet_schema(target))
+    except Exception:                    # noqa: BLE001 - an unreadable old file is what we are replacing
+        return []
+    return sorted(before - set(df.columns))
+
+
+def write(dataset: str, season: int, df: pl.DataFrame) -> tuple[int, list[str]]:
+    """Replace the snapshot, atomically, and say which columns it lost on the way.
+
+    Atomically because the app reads this directory while the scheduled task writes it: a torn parquet
+    is not a stale projection, it is a crash on the next page load. `os.replace` makes the swap a single
+    step, so a reader sees either the old file or the new one.
+    """
     out = OWN_RAW / dataset / f"season={season}"
     out.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(out / f"{dataset}.parquet")
-    return df.height
+    final = out / f"{dataset}.parquet"
+    lost = dropped_columns(final, df)
+    # The temp file must not end in .parquet: `lake._files` globs the partition directory, and a
+    # half-written sibling would be concatenated into the frame.
+    tmp = out / f".{dataset}.parquet.tmp"
+    df.write_parquet(tmp)
+    os.replace(tmp, final)
+    return df.height, lost
+
+
+def missed(outcome: int | str) -> bool:
+    """Did this (dataset, season) end up with nothing written?
+
+    An outcome is a row count when the write succeeded and a sentence when it did not -- except for a
+    write that succeeded with fewer columns than before, which is also a sentence and is emphatically
+    not a miss. The snapshot is on disk and current; one column of it is gone.
+    """
+    return isinstance(outcome, str) and not outcome[:1].isdigit()
 
 
 def refresh(datasets: list[str], seasons: list[int]) -> dict[tuple[str, int], int | str]:
@@ -75,7 +116,10 @@ def refresh(datasets: list[str], seasons: list[int]) -> dict[tuple[str, int], in
             if df.is_empty():
                 results[(dataset, season)] = "empty upstream"
                 continue
-            results[(dataset, season)] = write(dataset, season, df)
+            rows, lost = write(dataset, season, df)
+            results[(dataset, season)] = (
+                f"{rows} rows  UPSTREAM DROPPED: {', '.join(lost)}" if lost else rows
+            )
     lake.clear_cache()
     return results
 
@@ -96,12 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     for (dataset, season), outcome in sorted(results.items()):
         print(f"  {dataset:<14} {season}  {outcome}")
-        if isinstance(outcome, str):
+        if missed(outcome):
             failed += 1
     # Rosters and depth charts are the two that change who gets projected at all. An empty
     # schedule in August is a broken fetch, not a quiet season -- so any miss on these is an error.
     essential = {(d, s) for (d, s) in results if d in ("rosters", "depth_charts", "schedules")}
-    if any(isinstance(results[k], str) for k in essential):
+    if any(missed(results[k]) for k in essential):
         print("essential table missing -- projections would run on the previous snapshot", file=sys.stderr)
         return 2
     return 1 if failed else 0

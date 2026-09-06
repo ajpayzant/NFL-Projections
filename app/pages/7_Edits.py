@@ -10,6 +10,10 @@ what has no home anywhere else:
 
 - **Every edit.** One row each, with the base it was recorded against beside the engine's own number now
   -- *stale* is those two having come apart -- and the ↺ that drops one and leaves the rest.
+- **Un-override.** The reverse of the bulk tab, at the same scale: pick the players to stop having an
+  opinion about and every edit on each of them goes at once. Which is what makes overriding worth doing
+  selectively -- a held share only buys you "these twelve and the engine for the rest" if the thirteenth
+  is one button to hand back.
 - **Many at once.** The population scale: "every quarterback at slot 1 plays 16.5 games". Still one
   override per player, so any single row of it can be dropped from the list afterwards.
 - **League knobs.** The constants behind the model, `k_scale` among them: it multiplies every fitted
@@ -36,7 +40,7 @@ import polars as pl                                                          # n
 import streamlit as st                                                       # noqa: E402
 
 import ui                                                                    # noqa: E402
-from src.model import overrides                                              # noqa: E402
+from src.model import opportunity, overrides                                 # noqa: E402
 from src.model.overrides import Scenario                                     # noqa: E402
 
 view = ui.controls("Edits", icon="✏️")
@@ -120,7 +124,16 @@ with edits_tab:
                 "why": o.note or "", "field": o.field, "key": o.key, "week": o.week,
                 "mode": o.mode, "value": float(o.value),
             })
-        edits = pl.DataFrame(rows)
+        # The five columns that are legitimately null for most rows are pinned rather than inferred.
+        # polars infers a dtype from the first hundred rows only, and `week` is null on every season-wide
+        # edit -- so a scenario with a hundred of those before its first per-game one had the column
+        # typed as Null and then failed to append the int, taking the page down. Pinning is better than
+        # a longer inference window here because it is also right when *every* row is null: the column is
+        # still a week number, and a Null column would not read as one in the editor.
+        edits = pl.DataFrame(rows, schema_overrides={
+            "base": pl.Float64, "engine now": pl.Float64, "used now": pl.Float64,
+            "week": pl.Int64, "value": pl.Float64,
+        })
 
         ui.section(
             "Your edits, one at a time",
@@ -176,11 +189,16 @@ with edits_tab:
                                           chosen["week"]), {})
                         st.warning(f"Not applied: {rec.get('reason') or 'no matching rows'}", icon="⚠️")
 
-                    act = st.columns([2, 2, 4])
+                    mine = len(sc.touching(chosen["level"], chosen["key"]))
+                    act = st.columns([2, 2, 2, 3])
                     if act[0].button("↺ Drop this edit", key=f"drop:{chosen['id']}",
                                      help="follow the engine again on this one number"):
-                        ui.reset(level=chosen["level"], key=chosen["key"],
-                                 field_name=chosen["field"], week=chosen["week"])
+                        ui.drop_edit(chosen["level"], chosen["key"], chosen["field"], chosen["week"])
+                        st.rerun()
+                    if act[2].button(f"↺ Drop all {mine} on him", key=f"dropall:{chosen['id']}",
+                                     disabled=mine < 2,
+                                     help="every edit on this player or team, and nobody else's"):
+                        ui.drop_all(chosen["level"], chosen["key"])
                         st.rerun()
                     with act[1]:
                         # not for a release: it is not a quantity to re-argue, so the only two things to
@@ -192,8 +210,11 @@ with edits_tab:
                             ui.knob_popover(view, chosen["key"], chosen["field"],
                                             base=chosen["engine now"], key=f"edits:again:{chosen['id']}",
                                             week=chosen["week"])
-                    act[2].caption("Dropping one edit leaves the rest of the scenario alone. **Clear "
-                                   "all** at the top of the page is the other button.")
+                    act[3].caption(
+                        "Either button leaves everybody else alone — and returns him to the engine "
+                        "rather than to whatever he was mid-session. To walk back a group of players "
+                        "at once, use **Un-override** below."
+                    )
 
                 if chosen["level"] == "player" and chosen["key"] in names:
                     with st.expander(f"Everything else about {chosen['who']}"):
@@ -202,6 +223,45 @@ with edits_tab:
                             ui.player_panel(view, me.row(0, named=True),
                                             key=f"edits:panel:{chosen['id']}", compact=True,
                                             history=False)
+
+        st.divider()
+        # The bulk tab writes a population of overrides in one click, so there has to be one place that
+        # takes a population of them back off. Not a filter over fields: the unit somebody changes their
+        # mind about is a *man* -- "I have an opinion about these twelve receivers and I want the engine
+        # to have the rest" -- and dropping him whole is what returns his room to normalising around the
+        # players who are still held.
+        ui.section(
+            "Un-override",
+            "Pick the players or teams to stop overriding and every edit on them goes at once. What is "
+            "left keeps working the same way: a held share is still held, and the un-edited teammates of "
+            "whoever you dropped absorb his share back — not evenly, but in proportion to how much of "
+            "the pool each of them is already claiming.",
+        )
+        held = ([("player", k, n) for k, n in sc.counts("player").items()]
+                + [("team", k, n) for k, n in sc.counts("team").items()])
+        held.sort(key=lambda t: (-t[2], t[1]))
+
+        def who_label(item: tuple[str, str, int]) -> str:
+            level, key, n = item
+            name = names.get(key, key) if level == "player" else f"{key} · team"
+            return f"{name} — {n} edit{'s' if n != 1 else ''}"
+
+        picked = st.multiselect("Who to stop overriding", held, format_func=who_label,
+                                key="edits:unoverride",
+                                help="every edit on each one, season-wide and per week")
+        going = sum(n for _, _, n in picked)
+        un = st.columns([3, 2, 5])
+        if un[0].button(f"↺ Drop {going} edits on {len(picked)} of them", type="primary",
+                        width="stretch", disabled=not picked, key=ui._keyed("edits:unoverride:go")):
+            for level in ("player", "team"):
+                ui.drop_all(level, *[k for lv, k, _ in picked if lv == level])
+            st.rerun()
+        un[1].metric("would remain", len(sc.items) - going)
+        un[2].caption(
+            "Immediate and autosaved, like every other edit — the safety net is the scenario's own "
+            "backups, not a confirmation box. Dropping is per player, so a man you keep is untouched "
+            "even where the two of them share a receiving room."
+        )
 
         st.divider()
         ui.section(
@@ -338,6 +398,7 @@ with league_tab:
         "baseline.",
     )
     lg = {k: sc.league.get(k, defaults[k]) for k in overrides.LEAGUE_FIELDS}
+    fitted_tilt_value = float(opportunity.load_tilt().get("pool_tilt", 1.0))
     if sc.league:
         ui.chips(*[f"{ui.label(k)} = {v}" for k, v in sc.league.items()])
 
@@ -345,6 +406,27 @@ with league_tab:
     with left:
         st.markdown("**What the model is allowed to do**")
         lg["normalize_pools"] = st.toggle("normalize pools", value=lg["normalize_pools"])
+        lg["lock_edited_shares"] = st.toggle(
+            "hold the shares you type", value=lg["lock_edited_shares"],
+            help="On, a share you set is delivered at what you typed and the un-edited teammates absorb "
+                 "it. Off, your number is rescaled along with everybody else's — so 0.30 arrives as "
+                 "0.2545 and the edits list still reports it applied.",
+        )
+        # The exponent, with the fitted value as its default in the same shape `market_weight` uses. Worth
+        # a control rather than a constant precisely because the fit came back indifferent: held-out error
+        # cannot tell these apart, so it is a judgement about who is more likely to be wrong, and the
+        # person making the judgement should be able to move it and look at the board.
+        fitted_tilt = st.toggle("pool tilt: use the fitted value", value=lg["pool_tilt"] is None,
+                                help=f"currently {fitted_tilt_value:g}, from "
+                                     "data/fitted/pool_tilt.json — and the fit that chose it came back "
+                                     "indifferent, so it is a preference rather than a measurement")
+        lg["pool_tilt"] = None if fitted_tilt else st.slider(
+            "pool tilt", 0.0, 1.0,
+            float(lg["pool_tilt"] if lg["pool_tilt"] is not None else fitted_tilt_value), 0.05,
+            help="Who pays when a room claims more of a pool than it holds. 1 charges every claim the "
+                 "same fraction of itself; below 1 charges the small claims a larger fraction, so the "
+                 "starters keep more and the bench pays; 0 charges everyone the same absolute amount.",
+        )
         lg["use_context_factors"] = st.toggle("use context factors", value=lg["use_context_factors"])
         lg["schedule_renormalise"] = st.toggle(
             "schedule renormalise", value=lg["schedule_renormalise"],

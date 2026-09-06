@@ -51,10 +51,11 @@ HEADLINES = {
     "WR": ("games", "targets", "receptions", "receiving_yards", "receiving_tds"),
     "TE": ("games", "targets", "receptions", "receiving_yards", "receiving_tds"),
 }
-SCORING = ["fantasy_points", "points_per_game", "vs_starter", "drop_next"]
+SCORING = ["fantasy_points", "points_per_game", "if_healthy", "vs_starter", "drop_next"]
 
 FANTASY = ["overall_rank", "position_rank", "tier", "player", "team", "position", "games",
-           "fantasy_points", "points_per_game", "vs_starter", "drop_next", "delta_points"]
+           "fantasy_points", "points_per_game", "if_healthy", "vs_starter", "drop_next",
+           "delta_points"]
 
 # With a scenario live, the board carries what the edits did to each player -- `vs_baseline` points and
 # the position ranks he gained -- because a ranking is only worth as much as the reason it moved.
@@ -149,7 +150,7 @@ with board_tab:
                 shown, key="board:list", columns=[*LIST, "edited"], height=760,
                 config={**ui.stat_config(),
                         **ui.fixed(1, "fantasy_points", "vs_starter", "drop_next", "vs_baseline",
-                                   "games"),
+                                   "games", "if_healthy"),
                         **ui.fixed(2, "points_per_game"),
                         **ui.range_config(),
                         "line": st.column_config.TextColumn("projected line", width="large"),
@@ -205,7 +206,7 @@ with columns_tab:
         shown.head(int(limit)), height=620, order=order,
         config={**ui.stat_config(),
                 **ui.fixed(1, "fantasy_points", "vs_starter", "drop_next", "delta_points",
-                           "last_points", "vs_baseline"),
+                           "last_points", "vs_baseline", "if_healthy"),
                 **ui.fixed(2, "points_per_game"),
                 **ui.fixed(1, "games", "last_games"),
                 **ui.range_config()},
@@ -215,7 +216,10 @@ with columns_tab:
         "the gap to the next man at the same position; `delta_points` is against what he actually scored "
         "last season under the same scoring. Blank `delta_points` means he did not play then. Every count "
         "is already availability-weighted — a receiver expected to miss two games is projected for "
-        "fifteen games of targets, not seventeen with a discount applied afterwards."
+        "fifteen games of targets, not seventeen with a discount applied afterwards. `if_healthy` is the "
+        "same projection over a full seventeen, which is the number to hold a career line against: the "
+        "distance between it and `fantasy_points` is what availability cost him rather than a lower "
+        "opinion of him."
         + ("" if view.scenario.is_baseline else
            " `vs_baseline` and `ranks_gained` are this scenario against the same season with no edits.")
     )

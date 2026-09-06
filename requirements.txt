@@ -1,6 +1,6 @@
 # The engine and the app. Lower bounds rather than pins: nothing here is used near an edge, and a pinned
 # minor version ages into a conflict with the shared lake's own environment.
-polars>=1.30
+polars>=1.30             # run it with POLARS_MAX_THREADS=1 -- see run_app.bat for the crash it avoids
 numpy>=2.0
 pyarrow>=17.0            # reading the parquet lake
 streamlit>=1.40

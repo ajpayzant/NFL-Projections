@@ -276,13 +276,16 @@ def test_p_over_reads_the_draws_rather_than_interpolating_the_quantiles() -> Non
     assert np.isnan(sim.p_over("nobody", 100.0))
 
 
-def test_the_detail_players_get_a_week_by_week_range_and_a_range_per_stat() -> None:
+def test_every_player_gets_a_week_by_week_range_and_the_named_ones_a_range_per_stat() -> None:
     wk = _weekly(weeks=17)
     sim = simulate.run(wk, SETTINGS, _disp(share=0.3, usage=0.4, event=1.0), draws=1000,
                        detail=("AAA0",))
-    assert sim.weekly["player_id"].unique().to_list() == ["AAA0"]
-    assert sim.weekly.height == 17
+    # the weekly range is the whole board -- a start/sit call is where a floor is worth the most
+    assert sorted(sim.weekly["player_id"].unique()) == sorted(wk["player_id"].unique())
+    assert sim.weekly.height == 17 * 8
     assert (sim.weekly["p95"] > sim.weekly["p5"]).all()
+    # the per-stat range still costs draws, so it stays with the players asked for by name
+    assert sim.stats["player_id"].unique().to_list() == ["AAA0"]
 
     stats = dict(zip(sim.stats["stat"], sim.stats["mean"], strict=True))
     want = wk.filter(pl.col("player_id") == "AAA0")["targets"].sum()
@@ -306,20 +309,129 @@ def test_the_distribution_is_binned_for_plotting_with_the_lump_at_zero_kept_apar
     assert simulate.run(wk, SETTINGS, _disp(), draws=8).histogram("nobody").is_empty()
 
 
-def test_each_of_the_detail_players_weeks_carries_its_own_boom_and_bust_rate() -> None:
+def test_each_week_carries_its_own_boom_and_bust_rate() -> None:
     wk = _weekly(weeks=17)
-    sim = simulate.run(wk, SETTINGS, _disp(usage=0.4, event=1.0), draws=1000, detail=("AAA0",))
+    sim = simulate.run(wk, SETTINGS, _disp(usage=0.4, event=1.0), draws=1000)
     got = sim.weekly
     assert {"boom_rate", "bust_rate"} <= set(got.columns)
     assert ((got["boom_rate"] >= 0.0) & (got["boom_rate"] <= 1.0)).all()
-    # the fixture's 21-point weeks sit over the 15-point boom line and well over the 5-point bust one
-    assert got["boom_rate"].min() > 0.5
-    assert got["bust_rate"].max() < 0.15
+    # the lead receiver's 21-point weeks sit over the 15-point boom line and well over the 5-point bust
+    # one; the fourth man's 7-point weeks are the other way round, which is the whole point of the column
+    lead = got.filter(pl.col("player_id") == "AAA0")
+    back = got.filter(pl.col("player_id") == "AAA3")
+    assert lead["boom_rate"].min() > 0.5
+    assert lead["bust_rate"].max() < 0.15
+    assert back["boom_rate"].max() < lead["boom_rate"].min()
     # and against a line nobody can reach, no week booms
     high = simulate.run(wk, SETTINGS, replace_thresholds(_disp(usage=0.4), boom=1e6, bust=1e6),
-                        draws=200, detail=("AAA0",)).weekly
+                        draws=200).weekly
     assert high["boom_rate"].max() == pytest.approx(0.0)
     assert high["bust_rate"].min() == pytest.approx(1.0)
+
+
+def test_the_weekly_quantiles_off_the_counters_are_the_quantiles_off_the_draws() -> None:
+    """The weekly range is binned rather than stored, so the binning has to be worth trusting.
+
+    Checked against `np.quantile` on the draws themselves, on a distribution shaped like the hard case:
+    a third of the mass at exactly zero and a long right tail on the rest.
+    """
+    rng = np.random.default_rng(11)
+    n = 120_000
+    v = np.where(rng.random(n) < 0.32, 0.0, rng.lognormal(np.log(11.0), 0.75, n))
+    hi = np.float32(simulate.HIST_SPAN * 13.0)
+    b = np.where(v > 0.0,
+                 1 + np.minimum((v / hi * simulate.HIST_BINS).astype(int), simulate.HIST_BINS - 1), 0)
+    counts = np.bincount(b, minlength=simulate.HIST_BINS + 1)[None, :]
+    got = simulate._hist_q(counts, np.array([hi]))[:, 0]
+    want = np.quantile(v, simulate.QUANTILES)
+    # inside one bin, which is what the resolution claim in HIST_BINS says it will be
+    assert got == pytest.approx(want, abs=float(hi) / simulate.HIST_BINS)
+    # and the atom at zero comes back as flatly zero rather than interpolated into a fraction of a point
+    assert got[0] == 0.0 and want[0] == 0.0
+
+
+def test_a_week_he_may_miss_has_a_floor_of_zero_and_a_ceiling_that_is_a_full_game() -> None:
+    """The reading a start/sit call turns on: `p_play` belongs in the floor, not only in the mean."""
+    wk = _weekly(weeks=6, p_play=0.6)
+    sim = simulate.run(wk, SETTINGS, _disp(share=0.2, usage=0.3, event=1.0,
+                                           games=(0.0, 0.5, 1.0, 1.3)), draws=4000)
+    lead = sim.weekly.filter(pl.col("player_id") == "AAA0")
+    assert (lead["floor"] == 0.0).all()          # 40% of Sundays he is not out there
+    # the ceiling is a game he plays, so it clears the availability-blended projection comfortably
+    blended = float(wk.filter(pl.col("player_id") == "AAA0")["fantasy_points"][0])
+    assert lead["ceiling"].min() > 2.0 * blended
+    assert (lead["p50"] > 0.0).all()             # ... and the median is still a week he plays
+
+
+def test_the_weekly_floor_comes_in_two_parts_because_a_starters_fifth_percentile_is_always_zero() -> None:
+    """`p5` on a startable week is zero for anyone who misses more than a twentieth of them.
+
+    Which is true, and useless: measured on five held-out seasons it is zero for 96% of the startable
+    player-weeks, so as a column it says the same thing about everybody. The frame carries the two
+    statements the one number was hiding instead -- how often the week does not happen, and where the
+    floor is on the weeks that do -- and this is the arithmetic tying them to each other.
+    """
+    wk = _weekly(weeks=6, p_play=0.6)
+    d = _disp(share=0.2, usage=0.3, event=1.0, games=(0.0, 0.5, 1.0, 1.3))
+    lead = simulate.run(wk, SETTINGS, d, draws=6000).weekly.filter(pl.col("player_id") == "AAA0")
+    # he is out four Sundays in ten, and that is what the zero column is counting
+    assert lead["p_zero"].mean() == pytest.approx(0.4, abs=0.06)
+    # the honest floor is zero; the conditional one is a real line, and sits under the conditional median
+    assert (lead["p5"] == 0.0).all()
+    assert (lead["floor_playing"] > 0.0).all()
+    assert (lead["floor_playing"] < lead["median_playing"]).all()
+    assert (lead["median_playing"] <= lead["p95"]).all()
+
+    # with nothing to miss, the two floors are the same floor -- no zero atom to hold apart
+    sure = simulate.run(_weekly(weeks=6), SETTINGS, _disp(share=0.2, usage=0.3, event=1.0),
+                        draws=6000).weekly.filter(pl.col("player_id") == "AAA0")
+    assert sure["p_zero"].max() == pytest.approx(0.0)
+    assert sure["floor_playing"].to_numpy() == pytest.approx(sure["p5"].to_numpy())
+
+
+# --------------------------------------------------------------------------- #
+# the intervals the calibration does not fit, scored
+# --------------------------------------------------------------------------- #
+def test_the_weekly_coverage_check_scores_every_projected_sunday_including_the_missed_ones() -> None:
+    """The accounting only, on outcomes chosen to make the answer known in advance."""
+    wk = _weekly(weeks=17)
+    sim = simulate.run(wk, SETTINGS, _disp(share=0.3, usage=0.3, event=1.0), draws=1000)
+    season = sim.season.select("player_id")
+    dead_on = sim.weekly.select("player_id", "week", pl.col("p50").alias("a_points"))
+
+    got = simulate.week_coverage(sim, dead_on, season, min_projected=0.0, min_n=20)
+    row = got.filter(pl.col("position") == "ALL").row(0, named=True)
+    assert row["n"] == 17 * 8
+    assert row["cover_90"] == pytest.approx(1.0)      # every outcome is its own median
+    assert row["median_bias"] == pytest.approx(0.0, abs=0.01)
+
+    # a week nobody projected is a zero rather than an absent row, because the floor is mostly a
+    # statement about availability and dropping the missed weeks would score it where it never applied
+    missed = simulate.week_coverage(sim, dead_on.head(0), season, min_projected=0.0, min_n=20)
+    assert missed.filter(pl.col("position") == "ALL")["n"][0] == 17 * 8
+    assert missed.filter(pl.col("position") == "ALL")["below"][0] > 0.9
+
+    # and the population is cut on the projection: a line above everybody's leaves nothing to report
+    assert simulate.week_coverage(sim, dead_on, season, min_projected=1e9, min_n=20).is_empty()
+
+
+def test_the_per_stat_coverage_check_scores_the_count_intervals_and_not_only_the_points() -> None:
+    wk = _weekly(weeks=17)
+    everyone = tuple(wk["player_id"].unique().to_list())
+    sim = simulate.run(wk, SETTINGS, _disp(share=0.3, usage=0.3, event=1.0), draws=1000,
+                       detail=everyone)
+    wide = sim.stats.pivot(on="stat", index="player_id", values="p50")
+    actual = wide.select("player_id", *[pl.col(s).alias(f"a_{s}") for s in
+                                       ("targets", "receptions", "receiving_yards", "receiving_tds")])
+
+    got = simulate.stat_coverage(sim, actual, min_projected=0.0, min_n=4)
+    assert set(got["stat"]) == {"targets", "receptions", "receiving_yards", "receiving_tds"}
+    pooled = got.filter(pl.col("position") == "ALL")
+    assert pooled["cover_90"].min() == pytest.approx(1.0)
+    assert pooled["median_bias"].abs().max() == pytest.approx(0.0, abs=0.01)
+    # the ceiling is reported as a multiple of the median, which is the form a reader meets it in
+    assert (pooled["ceiling_over_median"] > 1.0).all()
+    assert simulate.stat_coverage(sim, actual, min_projected=1e9, min_n=4).is_empty()
 
 
 def test_moving_a_share_moves_that_players_range_and_his_teammates_with_it() -> None:

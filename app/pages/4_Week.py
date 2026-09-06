@@ -12,7 +12,9 @@ position in that week alone.
 One week picker and one fixture picker at the top, and then four tabs, widest first:
 
 1. **The week's board** — every man in the chosen week, the slate he is playing in, the same seventeen
-   weeks as a grid, and the calendar of byes behind all of it.
+   weeks as a grid, and the calendar of byes behind all of it. With **Ranges** on, a floor and a ceiling
+   for that Sunday beside each projection: the same simulation the season board runs, read one week deep
+   rather than summed, because a start/sit call is decided on the spread and not on the expectation.
 2. **One game** — the fixture picked above at the scale the engine actually builds at. `compose.weekly`
    is one row per player per game, so a game is not a slice of the answer, it *is* the answer, twice
    over: two offences with a projected volume each, divided among the men on their rosters, added back
@@ -122,8 +124,20 @@ with board_tab:
     ui.section(f"Week {int(week)}, a man at a time",
                "`rank at position that week` is ranked on this week alone, which is the number a "
                "start/sit argument is actually about — a season rank cannot say that a WR2 has the best "
-               "matchup on the board this Sunday.",
+               "matchup on the board this Sunday. Turn **Ranges** on and every man in the week carries a "
+               "floor and a ceiling for that Sunday as well as a projection, which is the reading the "
+               "argument usually turns on: a 12-point expectation that is 0-to-31 is a different start "
+               "from one that is 9-to-16, and the projection alone cannot tell them apart.",
                sub="click a name; his week is on the right")
+    # The same simulation the season board runs, read one week deep. Every player is in it -- the weekly
+    # range used to stop at whoever a page named -- so this is a join rather than a second run.
+    sim = ui.sim_controls(view, key="weekly:sim")
+    ranges = None
+    if sim is not None and not sim.weekly.is_empty():
+        ranges = sim.weekly.filter(pl.col("week") == int(week)).select(
+            "player_id", "floor", pl.col("p50").alias("week_p50"), "ceiling", "boom_rate",
+            "bust_rate", "p_zero", "floor_playing")
+        board = board.join(ranges, on="player_id", how="left")
     filters = st.columns([2, 2, 2, 2])
     with filters[0]:
         positions = ui.position_filter("weekly:pos")
@@ -139,7 +153,8 @@ with board_tab:
         # `week_rank` stays in the list on purpose: it is the one column this page has that the season
         # board cannot, and the reason to open the page at all
         WEEK_LIST = ["player", "position", "team", "opponent", "week_rank", "p_play",
-                     "fantasy_points", "edited"]
+                     "fantasy_points", *(["floor_playing", "ceiling", "p_zero", "boom_rate"]
+                                         if ranges is not None else []), "edited"]
         STAT_LIST = ["player", "position", "team", "opponent", "week_rank", "p_play"]
         listing = shown.sort("fantasy_points", descending=True).head(300)
         if mode == "Fantasy":
@@ -155,6 +170,7 @@ with board_tab:
                 listing, key=f"weekly:list:{int(week)}:{mode}", columns=cols, height=560,
                 config={**ui.stat_config([c for c in cols if c in ui.ALL_STATS]),
                         **ui.fixed(1, "fantasy_points"), **ui.percent("p_play"),
+                        **ui.range_config(per_game=True),
                         "week_rank": st.column_config.NumberColumn("rank", format="%d",
                                                                    width="small"),
                         "edited": st.column_config.CheckboxColumn("✏️", width="small")},
@@ -199,10 +215,48 @@ with board_tab:
                         ui.knob_popover(view, man["player_id"], "p_play",
                                         base=man.get("p_play"), week=int(week),
                                         key=f"weekly:play:{int(week)}", digits=3)
+                    if ranges is not None and man.get("ceiling") is not None:
+                        st.caption(f"The simulated week {int(week)} — the same run the season board "
+                                   "reads, one week deep rather than summed")
+                        ui.tiles([
+                            {"name": "nothing at all", "value": man.get("p_zero"), "percent": True,
+                             "digits": 3, "tone": "down",
+                             "sub": "share of these Sundays he scores zero"},
+                            {"name": "floor if he plays", "value": man.get("floor_playing"),
+                             "sub": "5th percentile of the Sundays he scores"},
+                            {"name": "median", "value": man.get("week_p50"),
+                             "sub": "half his Sundays are under this"},
+                            {"name": "ceiling", "value": man.get("ceiling"), "highlight": True,
+                             "sub": "95th percentile", "tone": "up"},
+                            {"name": "boom", "value": man.get("boom_rate"), "percent": True,
+                             "digits": 3, "sub": f"weeks over the {man['position']} boom line"},
+                        ])
+                        # Two numbers rather than one p5, because on held-out seasons 96% of startable
+                        # player-weeks have a fifth percentile of exactly zero -- correct arithmetic and
+                        # a useless column, since it says the same thing about everybody.
+                        st.caption(
+                            f"His plain 5th percentile is {man.get('floor', 0.0):.1f}. A startable "
+                            "player's is nearly always zero, because missing more than one Sunday in "
+                            "twenty puts zero at the fifth percentile — so the risk of nothing and the "
+                            "floor of a Sunday he shows up are shown as the two separate readings they "
+                            "are."
+                        )
                     ui.stat_blocks(man, man.get("position"))
-                    st.caption("His seventeen games — this week is one bar of it")
+                    st.caption("His seventeen games — this week is one bar of it"
+                               + (", with the 5th-to-95th band behind them" if ranges is not None
+                                  else ""))
                     his = ui.weekly(view).filter(pl.col("player_id") == man["player_id"]).sort("week")
-                    ui.week_bars(his.select("week", "fantasy_points"), "fantasy_points", height=200)
+                    band = None
+                    if sim is not None and not sim.weekly.is_empty():
+                        his = his.join(
+                            sim.weekly.filter(pl.col("player_id") == man["player_id"])
+                            .select("week", pl.col("p5").alias("week_floor"),
+                                    pl.col("p95").alias("week_ceiling")),
+                            on="week", how="left")
+                        band = ("week_floor", "week_ceiling")
+                    ui.week_bars(his.select("week", "fantasy_points",
+                                            *(band if band else ())), "fantasy_points", height=200,
+                                 band=band)
 
         ui.section("The top of the board this week", sub=f"week {int(week)}, best fifteen")
         ui.rank_bars(listing.head(15), "fantasy_points", "player", height=320, digits=1)

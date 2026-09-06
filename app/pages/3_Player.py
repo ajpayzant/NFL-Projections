@@ -230,6 +230,21 @@ with bench_tab:
     )
     ui.bench(view, pid, key="player:bench")
 
+    # The way out, on the page the way in is on. Holding an edit at what was typed is only usable if
+    # walking one back is as cheap as making it -- the point of the whole arrangement is a strong opinion
+    # about a few players and the engine everywhere else, and that needs "he is no longer one of the few"
+    # to be one button rather than a hunt through a ledger.
+    if ui.live().touching("player", pid):
+        st.divider()
+        ui.section(
+            "What you are already overriding on him",
+            "Each one with the engine's own number beside it, and ↺ to follow the engine again — on one "
+            f"of them, or on all of them at once. Dropping every edit on {me['player']} hands his "
+            "shares back to his room, where the teammates you have *not* edited absorb them in "
+            "proportion to what they already claim.",
+        )
+        ui.edit_list("player", pid, v=view, key="player:adjust")
+
 # --------------------------------------------------------------------------- #
 # 3. the stat line
 # --------------------------------------------------------------------------- #
@@ -275,7 +290,7 @@ with weeks_tab:
         wr = sim_weeks.weekly.filter(pl.col("player_id") == pid).select(
             "week", pl.col("p5").alias("week_p5"), pl.col("p50").alias("week_p50"),
             pl.col("p95").alias("week_p95"), pl.col("boom_rate").alias("week_boom"),
-            pl.col("bust_rate").alias("week_bust"),
+            pl.col("bust_rate").alias("week_bust"), "p_zero", "floor_playing",
         )
         games = games.join(wr, on="week", how="left")
         band = ("week_p5", "week_p95")
@@ -285,11 +300,15 @@ with weeks_tab:
                "only 60% likely to play is 60% of a line, not a full one. With ranges on, the shaded "
                "band behind the bars is the 5th to 95th percentile of the simulated week — which is what "
                "a start/sit call actually turns on, because a 12-point expectation that is 4-to-26 is a "
-               "different decision from one that is 10-to-14.")
+               "different decision from one that is 10-to-14. The table splits that fifth percentile in "
+               "two, because for anyone worth starting it is otherwise always zero: **chance of nothing** "
+               "is how often the week never happens, and **floor if he plays** is the fifth percentile of "
+               "the weeks it does.")
     ui.week_bars(games, band=band)
     ui.focus_table(
-        games, ["week", "opponent", "is_home", "p_play", "fantasy_points", "implied_points", "spread",
-                *stats[:4]], key="player:weeks", height=520,
+        games, ["week", "opponent", "is_home", "p_play", "fantasy_points",
+                *(["floor_playing", "week_p95", "p_zero"] if band else []),
+                "implied_points", "spread", *stats[:4]], key="player:weeks", height=520,
         config={**ui.fixed(2, "fantasy_points", "p_play", *stats),
                 **ui.fixed(1, "spread", "total", "implied_points"),
                 **ui.range_config(per_game=True),

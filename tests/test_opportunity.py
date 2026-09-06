@@ -277,3 +277,149 @@ def test_the_toggle_is_recorded_against_each_row(settings):
     assert not on.filter(~pl.col("exclusive"))["normalized"].any()
     # the raw sums are a property of the roster, not of the toggle
     assert (off["raw_sum"] - on["raw_sum"]).abs().max() < 1e-12
+
+
+# --------------------------------------------------------------------------- #
+# who pays for a room that over-claims, and whose number is held
+# --------------------------------------------------------------------------- #
+# On a written-out room rather than on the season: the allocator's properties are arithmetic, and a
+# five-man frame states them exactly where a 918-player run states them to a tolerance. The engine-wide
+# versions are the pool-sum tests above, which run at whatever exponent is in force.
+ROOM = ["game_id", "team"]
+
+
+def room(claims: list[float], p_play: list[float] | None = None,
+         locked: list[bool] | None = None) -> pl.DataFrame:
+    """One team, one game: a claim each, and optionally an availability and a lock each.
+
+    In depth order, because `_queue_alloc` fills the chart by `depth_slot` and the list is written the
+    way a room reads -- starter first.
+    """
+    n = len(claims)
+    return pl.DataFrame({
+        "game_id": ["g"] * n, "team": ["T"] * n,
+        "player_id": [f"p{i}" for i in range(n)], "depth_slot": list(range(1, n + 1)),
+        "claim": claims,
+        "p_play": [1.0] * n if p_play is None else p_play,
+        "locked": [False] * n if locked is None else locked,
+    })
+
+
+def settle(frame: pl.DataFrame, want: float, tilt: float = 1.0,
+           locks: bool = False, queue: bool = False) -> list[float]:
+    alloc = opportunity._settle(
+        pl.col("claim"),
+        opportunity._tilt_weight(pl.col("claim"), pl.col("p_play"), tilt),
+        pl.lit(want),
+        pl.col("locked") if locks else None,
+        queue,
+    )
+    return frame.select(alloc.alias("got"))["got"].to_list()
+
+
+def test_tilt_one_is_the_flat_rescale_to_the_last_bit():
+    """The identity that makes 1.0 a safe fallback: it has to change no number at all."""
+    claims = [0.31, 0.22, 0.14, 0.09, 0.04, 0.008]
+    want = 0.9977
+    got = settle(room(claims), want, tilt=1.0)
+    total = sum(claims)
+    assert got == pytest.approx([c * want / total for c in claims], abs=1e-15)
+
+
+def test_every_exponent_leaves_the_pool_exact():
+    """The clip in `take` can leave a room short of paying; the second line is what closes it."""
+    for tilt in (1.0, 0.85, 0.7, 0.4, 0.0):
+        got = settle(room([0.34, 0.25, 0.18, 0.11, 0.05, 0.002]), 0.9977, tilt=tilt)
+        assert sum(got) == pytest.approx(0.9977, abs=1e-12), tilt
+        assert min(got) >= 0.0, tilt
+
+
+def test_a_lower_exponent_charges_the_small_claims_more():
+    """The whole point of the exponent, as a monotone statement rather than a fitted number.
+
+    Reading the same over-claiming room down the grid: the biggest claim keeps more of itself and the
+    smallest keeps less, every step of the way. `0.0` is the far end -- equal *absolute* amounts, so the
+    bench pays first -- and it is in the list to show the direction does not turn round somewhere.
+    """
+    claims = [0.34, 0.25, 0.18, 0.11, 0.05, 0.02]      # sums to 0.95 against a 0.90 pool
+    kept = [settle(room(claims), 0.90, tilt=t) for t in (1.0, 0.85, 0.7, 0.4, 0.0)]
+    top = [k[0] / claims[0] for k in kept]
+    bench = [k[-1] / claims[-1] for k in kept]
+    assert top == sorted(top), f"the starter did not keep more as the exponent fell: {top}"
+    assert bench == sorted(bench, reverse=True), f"the bench did not pay more: {bench}"
+
+
+def test_an_under_claiming_room_is_scaled_up_and_not_tilted():
+    """There is no evidence about who deserves a share of a shortfall, so everybody gets the same lift."""
+    claims = [0.30, 0.20, 0.10, 0.02]                   # sums to 0.62 against a 0.90 pool
+    for tilt in (1.0, 0.55, 0.0):
+        got = settle(room(claims), 0.90, tilt=tilt)
+        lift = [g / c for g, c in zip(got, claims, strict=True)]
+        assert lift == pytest.approx([lift[0]] * len(claims), abs=1e-12), tilt
+
+
+# A room typed past its own pool, which is the case a lock is *for*: the man is pushed up, the room now
+# claims 1.25 of a 0.9977 pool, and somebody has to pay. (A room that under-claims has the opposite
+# behaviour by design -- the teammates are lifted rather than charged -- which is its own test above.)
+PUSHED = [0.30, 0.35, 0.28, 0.20, 0.12]
+FIRST_LOCKED = [True, False, False, False, False]
+
+
+def test_a_locked_share_is_delivered_at_what_was_typed():
+    """The bug this was written for: "set his target share to 0.30" used to deliver 0.2545."""
+    got = settle(room(PUSHED, locked=FIRST_LOCKED), 0.9977, tilt=0.85, locks=True)
+    assert got[0] == pytest.approx(0.30, abs=1e-12)
+    assert sum(got) == pytest.approx(0.9977, abs=1e-12)
+    # and the room he is in is what moved: every un-edited teammate paid something
+    assert all(g < c for g, c in zip(got[1:], PUSHED[1:], strict=True))
+
+
+def test_without_the_lock_the_same_typed_share_is_rescaled_away():
+    """The alternative reading, kept as a test because it is a supported setting and not a bug."""
+    assert settle(room(PUSHED, locked=FIRST_LOCKED), 0.9977, tilt=0.85, locks=False)[0] < 0.30 - 1e-6
+
+
+def test_locks_that_claim_more_than_the_pool_are_scaled_against_each_other():
+    """A room typed past its own pool cannot have what it asked for, and the pool still has to balance.
+
+    What is asserted is the choice: the locks keep their *ratios* and the un-edited men go to zero,
+    rather than the team being allowed to throw more passes than it is projected to throw.
+    """
+    frame = room([0.70, 0.60, 0.20, 0.10], locked=[True, True, False, False])
+    got = settle(frame, 1.0, tilt=0.7, locks=True)
+    assert sum(got) == pytest.approx(1.0, abs=1e-12)
+    assert got[0] / got[1] == pytest.approx(0.70 / 0.60, abs=1e-12)
+    assert got[2] == pytest.approx(0.0, abs=1e-12)
+    assert got[3] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_a_queue_pool_still_fills_in_depth_order_around_a_lock():
+    """Dropbacks are one man's job: the backup only takes what the starter's lock leaves."""
+    frame = room([1.0, 0.9, 0.5], locked=[True, False, False])
+    got = settle(frame, 1.0, tilt=0.7, locks=True, queue=True)
+    assert got == pytest.approx([1.0, 0.0, 0.0], abs=1e-12)
+    held = room([0.6, 0.9, 0.5], locked=[True, False, False])
+    got = settle(held, 1.0, tilt=0.7, locks=True, queue=True)
+    assert got[0] == pytest.approx(0.6, abs=1e-12)      # his own number, not the front of the queue
+    assert sum(got) == pytest.approx(1.0, abs=1e-12)
+    assert got[1] > got[2], "the queue stopped running in depth order behind the lock"
+
+
+def test_availability_stays_linear_whatever_the_exponent_is():
+    """`_tilt_weight` bends the share and leaves the games alone, which is a counting fact.
+
+    Two men on the same share, one of them available for half the season: his claim is half and so is
+    the amount of the room's disagreement he can be charged for, at every exponent. The exponent is
+    about how wrong a *rate* is, and a man cannot be wrong about games he is not there for.
+    """
+    for tilt in (1.0, 0.7, 0.0):
+        w = room([0.2, 0.1], p_play=[1.0, 0.5]).select(       # equal shares, half the availability
+            opportunity._tilt_weight(pl.col("claim"), pl.col("p_play"), tilt).alias("w")
+        )["w"].to_list()
+        assert w[0] / w[1] == pytest.approx(2.0, rel=1e-12), tilt
+
+
+def test_the_exponent_in_force_is_the_scenario_before_the_fitted_value(settings):
+    assert opportunity.tilt_of(replace(settings, pool_tilt=0.5)) == 0.5
+    assert opportunity.tilt_of(replace(settings, pool_tilt=None)) == pytest.approx(
+        float(opportunity.load_tilt().get("pool_tilt", 1.0)))

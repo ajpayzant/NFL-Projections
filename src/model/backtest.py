@@ -48,11 +48,13 @@ model can win every table above and still miss the floor it advertised one seaso
     python -m src.model.backtest --targets 2024 2025
     python -m src.model.backtest --variants full workbook ewma
     python -m src.model.backtest --no-intervals                # skip the Monte Carlo per season
+    python -m src.model.backtest --fit-tilt                    # fit Settings.pool_tilt and write it
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -133,6 +135,8 @@ VARIANTS = (
             lambda s, f: (s, _all_k(f, 1e12))),
     Variant("no_normalise", "ablate pool normalisation",
             lambda s, f: (replace(s, normalize_pools=False), f)),
+    Variant("flat_pools", "ablate the pool tilt: normalise, but charge the residual evenly",
+            lambda s, f: (replace(s, pool_tilt=1.0), f)),
     Variant("flat_efficiency", "ablate the per-game efficiency factors",
             lambda s, f: (replace(s, use_context_factors=False), f)),
     Variant("no_rookie_curve", "ablate rookie draft curves",
@@ -398,6 +402,279 @@ def run(
     players = pl.concat(scored, how="diagonal_relaxed")
     return {"players": players, "summary": summarise(players),
             "coverage": pl.DataFrame(cover)}
+
+
+# --------------------------------------------------------------------------- #
+# fitting the pool tilt
+# --------------------------------------------------------------------------- #
+# Coarse on purpose. The exponent is a shape, not a rate: the difference between 0.5 and 0.55 is a
+# fraction of a target a season, and a grid fine enough to resolve it is a grid fine enough to fit the
+# noise in five held-out seasons.
+TILT_GRID = (1.0, 0.85, 0.7, 0.55, 0.4, 0.25, 0.0)
+
+# The pools the tilt actually decides, and the only two whose season totals are in `SCORED` so they can
+# be checked against what happened. Both are big, both are exclusive committees, and between them they
+# carry every skill-position count downstream. The queued pools are excluded because the tilt does not
+# touch them, and the red-zone pools because a season's worth of them is a dozen events per player and
+# the sampling error swamps the effect.
+TILT_POOLS = ("targets", "carries")
+
+# How much worse composed fantasy points are allowed to get in exchange for better opportunity counts.
+# Not zero, because the two are measured on different populations and a tie is not a match, but small:
+# the board is what a user reads, and a tilt that fixes the pools by making the board worse has fixed
+# nothing.
+TILT_POINTS_TOLERANCE = 0.001
+
+# How much an exponent has to beat the flat rescale by before the win is called a win. Held-out
+# per-game MAE across the whole grid spans about 0.4 of a per-mille, which is smaller than the
+# difference between adjacent grid points and far smaller than anything a season of held-out data can
+# resolve -- so without this, `choose_tilt` reports the argmin of the noise and dresses it up as a
+# measurement. Inside the margin the grid has not chosen, and saying so is the honest output.
+TILT_FLAT_MARGIN = 0.002
+
+# The population and the grain the tilt is fitted on, and both are deliberate.
+#
+# **Per game, not per season.** The tilt divides a *share*, and a season total is a share multiplied by
+# an availability estimate the tilt has no effect on whatever. Scoring totals therefore adds the whole
+# variance of the availability model to the measurement and answers a different question: the lowest
+# decile of projected season targets over-runs its projection by 200%, entirely because a man projected
+# for four games who plays twelve triples his line, which says nothing about who should pay for a room
+# that over-claims.
+#
+# **Regulars, not everyone who played.** A per-game rate off two games is not a per-game rate, and this
+# is the cut the repo already defines as the population a lineup is drawn from.
+TILT_GRAIN_VIEW = "regulars"
+
+
+def per_game(scored: pl.DataFrame, stats: tuple[str, ...] = TILT_POOLS) -> pl.DataFrame:
+    """Add `pg_<stat>` and `a_pg_<stat>`: the same counts divided by the games each side is over.
+
+    Naming follows `score_frame`'s convention so `_metrics` can score them unchanged -- a projection is
+    `pg_targets` and what happened is `a_pg_targets`. Both denominators are the *frame's own*: the
+    projection is spread over the games it projected and the outcome over the games he played, so what
+    is compared is two per-game rates and not one rate against a total.
+    """
+    have = [s for s in stats if s in scored.columns]
+
+    def rate(num: str, den: str) -> pl.Expr:
+        # null rather than NaN where there are no games: a projection of nobody is not a rate of zero,
+        # and one NaN in a column takes `_metrics`' mean and correlation with it
+        return pl.when(pl.col(den) > 0).then(pl.col(num) / pl.col(den))
+
+    return scored.with_columns(
+        *[rate(s, "games").alias(f"pg_{s}") for s in have],
+        *[rate(f"a_{s}", "a_games").alias(f"a_pg_{s}") for s in have],
+    )
+
+
+def tilt_grid(
+    targets: tuple[int, ...] | None = None,
+    grid: tuple[float, ...] = TILT_GRID,
+    scoring: str | None = None,
+    view: str = TILT_GRAIN_VIEW,
+    verbose: bool = True,
+) -> dict[str, pl.DataFrame]:
+    """Score every exponent in `grid` on held-out seasons. `grid` is one row per exponent.
+
+    Everything except the exponent is the `full` variant, ex-ante per season exactly as `run` builds
+    it, so the only thing varying down the column is who pays for a room that over-claims.
+
+    `rel` is the objective: each pool's per-game MAE divided by its own at 1.0, averaged over the pools.
+    Relative rather than absolute because a team throws four times as often as it hands off, and a raw
+    sum of MAEs would fit the biggest pool and call it a fit of the model. Per-game, and on `regulars`,
+    for the reasons in `TILT_GRAIN_VIEW`. The season totals are reported beside it so the choice can be
+    checked against the grain it was not made on.
+    """
+    targets = targets or tuple(range(FIRST_TARGET, LAST_COMPLETE_SEASON + 1))
+    base = base_settings(scoring)
+    frames = []
+    for season in targets:
+        ex = ex_ante(season, base)
+        for tilt in grid:
+            pred = project(season, replace(base, pool_tilt=tilt), ex)
+            frames.append(score_frame(pred, ex).with_columns(pl.lit(float(tilt)).alias("tilt")))
+            if verbose:
+                m = _metrics(per_game(frames[-1]).filter(pl.col(view)), "pg_targets")
+                print(f"  {season} tilt {tilt:<4}  targets/game mae {m['mae']:.4f}"
+                      f"  bias {m['bias']:+.4f}")
+    scored = (per_game(pl.concat(frames, how="diagonal_relaxed")).filter(pl.col(view))
+              .drop_nulls([f"pg_{p}" for p in TILT_POOLS]))
+
+    rows = []
+    for tilt in grid:
+        g = scored.filter(pl.col("tilt") == tilt)
+        row: dict = {"tilt": float(tilt), "n": g.height}
+        for stat in (*[f"pg_{p}" for p in TILT_POOLS], *TILT_POOLS, "fantasy_points"):
+            m = _metrics(g, stat)
+            row |= {f"{stat}_mae": m["mae"], f"{stat}_bias": m["bias"]}
+        rows.append(row)
+    out = pl.DataFrame(rows)
+    flat = out.filter(pl.col("tilt") == 1.0)
+    if not flat.is_empty():                  # a grid without the identity has nothing to be relative to
+        ref = flat.row(0, named=True)
+        out = out.with_columns(
+            pl.mean_horizontal([pl.col(f"pg_{p}_mae") / ref[f"pg_{p}_mae"] for p in TILT_POOLS])
+            .alias("rel"),
+            (pl.col("fantasy_points_mae") / ref["fantasy_points_mae"]).alias("rel_points"),
+        )
+    return {"grid": out, "players": scored}
+
+
+def tilt_calibration(scored: pl.DataFrame, stat: str = "targets",
+                     position: str = "WR") -> pl.DataFrame:
+    """The calibration line of per-game usage under each exponent -- the diagnostic that decides.
+
+    `tilt_bias` on its own cannot settle anything, because bucketing on the *projection* produces a
+    low bucket that over-runs and a high bucket that falls short for a model with no bias at all: any
+    noise in the estimate puts genuinely-busier players in the low bucket. That is regression to the
+    mean, it is the trap `calibration` is written around, and it looks exactly like the pattern the
+    tilt was built to fix.
+
+    A slope separates them. Regressing what happened on what was projected, a **slope below 1** means
+    the projections are spread too wide, so the fix is to compress them -- and a tilt below 1 spreads
+    them *further*, because it takes more from the small claims and leaves the large ones alone. Above 1
+    means the opposite and the tilt is pushing the right way. The exponent's whole justification is in
+    this column, so it is printed next to the choice rather than left for somebody to go and check.
+    """
+    import numpy as np
+
+    col, actual = f"pg_{stat}", f"a_pg_{stat}"
+    keep = scored.filter(pl.col("position") == position) if position else scored
+    rows = []
+    for tilt in sorted(keep["tilt"].unique().to_list()):
+        g = keep.filter(pl.col("tilt") == tilt).drop_nulls([col, actual])
+        x = g[col].to_numpy().astype(float)
+        y = g[actual].to_numpy().astype(float)
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() < 10:
+            continue
+        slope, intercept = np.polyfit(x[m], y[m], 1)
+        rows.append({"tilt": float(tilt), "n": int(m.sum()), "slope": float(slope),
+                     "intercept": float(intercept),
+                     "mean_err": float((y[m] - x[m]).mean())})
+    return pl.DataFrame(rows)
+
+
+def tilt_bias(scored: pl.DataFrame, stat: str = "targets", position: str = "WR",
+              buckets: int = 8) -> pl.DataFrame:
+    """Per-usage bias by exponent: the table the tilt exists to flatten.
+
+    Buckets of *projected* per-game usage taken at `tilt = 1`, so a bucket is the same set of players
+    under every exponent and reading across a row compares like with like. Bias in percent of the
+    projection, because a bench receiver 1 target a game high and a starter 1 target a game high are
+    not the same error, and the whole argument for the tilt is that they are not.
+    """
+    col, actual = f"pg_{stat}", f"a_pg_{stat}"
+    keep = scored.filter((pl.col("position") == position) & pl.col(col).is_not_null()
+                         & pl.col(actual).is_not_null())
+    # `qcut` returns a categorical whose physical codes are in order of first appearance, not in order
+    # of the bucket -- so the label is parsed back out of the string rather than cast from the category
+    at_one = (keep.filter(pl.col("tilt") == 1.0)
+              .select("player_id", "season",
+                      pl.col(col).qcut(buckets, labels=[str(i) for i in range(buckets)],
+                                       allow_duplicates=True)
+                      .cast(pl.String).cast(pl.Int32).alias("bucket")))
+    # named `tilt=x` rather than pivoted on the float, so the columns read in grid order instead of the
+    # alphabetical order a float-derived name would give ("0.25" before "1.0" before "0.4")
+    got = (keep.join(at_one, on=["player_id", "season"], how="inner")
+           .drop_nulls("bucket")
+           .group_by("bucket", "tilt")
+           .agg(pl.len().alias("n"), pl.col(col).mean().alias("projected"),
+                (100.0 * (pl.col(col) - pl.col(actual)).sum() / pl.col(col).sum()).alias("bias_pct"))
+           .with_columns(("tilt=" + pl.col("tilt").cast(pl.String)).alias("label")))
+    per_bucket = (got.filter(pl.col("tilt") == 1.0)
+                  .select("bucket", "n", pl.col("projected").round(2).alias("per_game")))
+    order = [f"tilt={t}" for t in sorted(got["tilt"].unique().to_list(), reverse=True)]
+    wide = got.pivot("label", index="bucket", values="bias_pct")
+    return (per_bucket.join(wide, on="bucket", how="left")
+            .select("bucket", "n", "per_game", *[c for c in order if c in wide.columns])
+            .sort("bucket"))
+
+
+def choose_tilt(grid: pl.DataFrame) -> dict:
+    """The exponent the grid picks, and the reason -- including when the reason is "it did not".
+
+    Four clauses, and only one of them is a measurement.
+
+    The best `rel` wins; composed fantasy points veto it if it cost more than
+    `TILT_POINTS_TOLERANCE`; and the flat rescale winning outright is a result rather than a failure,
+    because it would say a receiving room's error really is spread evenly, which is what the code did
+    before this and what the exponent exists to test rather than to assume.
+
+    The fourth clause is the one that fires on this data. When nothing beats the flat rescale by
+    `TILT_FLAT_MARGIN` the grid is flat, the argmin is noise, and picking it would be reporting a
+    coin toss as a fit. What is returned then is the *mildest* departure from the identity -- the
+    smallest exponent-shaped change that still charges the residual by claim size -- flagged
+    `indifferent`, so the number is on the record as a stated preference the accuracy measurement did
+    not object to and not as a number the accuracy measurement produced.
+    """
+    if "rel" not in grid.columns:
+        return {"pool_tilt": 1.0, "reason": "no identity row in the grid to compare against"}
+    ranked = grid.sort("rel")
+    best = ranked.row(0, named=True)
+    if best["tilt"] == 1.0:
+        return {"pool_tilt": 1.0, "reason": "the flat rescale wins on held-out opportunity error",
+                **{k: best[k] for k in ("rel", "rel_points")}}
+    if best["rel_points"] > 1.0 + TILT_POINTS_TOLERANCE:
+        return {"pool_tilt": 1.0,
+                "reason": f"tilt {best['tilt']:g} wins the pools (rel {best['rel']:.4f}) and loses "
+                          f"the board (points rel {best['rel_points']:.4f}), so it is not taken",
+                "rejected": float(best["tilt"])}
+    if 1.0 - best["rel"] < TILT_FLAT_MARGIN:
+        under = [t for t in grid["tilt"].to_list() if t < 1.0]
+        mild = max(under) if under else 1.0
+        row = grid.filter(pl.col("tilt") == mild).row(0, named=True)
+        return {"pool_tilt": float(mild), "indifferent": True,
+                "reason": f"held-out error is flat across the grid -- the best exponent "
+                          f"({best['tilt']:g}) beats the flat rescale by "
+                          f"{100 * (1 - best['rel']):.3f}%, inside the "
+                          f"{100 * TILT_FLAT_MARGIN:g}% margin -- so the exponent is not a "
+                          f"measurement here; the mildest tilt in the grid is taken",
+                **{k: row[k] for k in ("rel", "rel_points")}}
+    return {"pool_tilt": float(best["tilt"]),
+            "reason": "lowest held-out MAE across the tilted pools, no cost to composed points",
+            **{k: best[k] for k in ("rel", "rel_points")}}
+
+
+def fit_tilt(
+    targets: tuple[int, ...] | None = None,
+    grid: tuple[float, ...] = TILT_GRID,
+    scoring: str | None = None,
+    write: bool = True,
+) -> dict:
+    """Fit `Settings.pool_tilt` and write it where `opportunity.load_tilt` reads it."""
+    targets = targets or tuple(range(FIRST_TARGET, LAST_COMPLETE_SEASON + 1))
+    art = tilt_grid(targets, grid, scoring)
+    table = art["grid"]
+    chosen = choose_tilt(table)
+    out = {
+        **chosen,
+        "seasons": list(targets),
+        "grid": {f"{r['tilt']:g}": r.get("rel") for r in table.iter_rows(named=True)},
+        "pools": list(TILT_POOLS),
+    }
+    if write:
+        ensure_dirs()
+        opportunity.TILT_PATH.write_text(json.dumps(out, indent=2), encoding="utf-8")
+        opportunity.load_tilt.cache_clear()
+
+    pl.Config.set_tbl_width_chars(220)
+    pl.Config.set_tbl_cols(20)
+    print(f"\nPOOL TILT  held-out error by exponent, `{TILT_GRAIN_VIEW}` view. 1.0 is the flat rescale.")
+    print(table.with_columns(pl.col("^pg_.*$").round(4),
+                             pl.col("^targets_.*$|^carries_.*$|^fantasy_.*$").round(2),
+                             pl.col("^rel.*$").round(4)))
+    print("\nWR TARGETS PER GAME, bias as % of projection, by bucket of projected usage")
+    print("(negative = under-projected. Read it with the calibration line below, not on its own.)")
+    print(tilt_bias(art["players"]).with_columns(pl.col("^tilt=.*$").round(1)))
+    print("\nCALIBRATION  WR targets per game, actual regressed on projected. Slope 1 is the claim;")
+    print("below 1 means the projections are already too spread, and a tilt below 1 spreads them more.")
+    print(tilt_calibration(art["players"]).with_columns(
+        pl.col("slope").round(4), pl.col("intercept").round(4), pl.col("mean_err").round(4)))
+    print(f"\nchosen pool_tilt = {out['pool_tilt']:g}  ({out['reason']})")
+    if not write:
+        print(f"--dry-run: {opportunity.TILT_PATH.name} not written")
+    return out
 
 
 def decisions(summary: pl.DataFrame, view: str = "played") -> pl.DataFrame:
@@ -676,10 +953,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--interval-draws", type=int, default=1500)
     p.add_argument("--interval-seasons", type=int, nargs="+", default=None,
                    help="seasons to score intervals on (default the last two target seasons)")
+    p.add_argument("--fit-tilt", action="store_true",
+                   help=f"fit Settings.pool_tilt over {TILT_GRID} and write {opportunity.TILT_PATH.name}")
+    p.add_argument("--dry-run", action="store_true", help="with --fit-tilt, print but do not write")
     a = p.parse_args(argv)
 
     ensure_dirs()
     targets = tuple(a.targets) if a.targets else tuple(range(FIRST_TARGET, LAST_COMPLETE_SEASON + 1))
+    if a.fit_tilt:
+        fit_tilt(targets, scoring=a.scoring, write=not a.dry_run)
+        return 0
     art = run(targets, tuple(a.variants) if a.variants else None,
               a.scoring, verbose=not a.quiet)
     art["players"].write_parquet(PLAYER_PATH)
