@@ -136,15 +136,23 @@ def test_a_room_sheet_names_real_ratings_and_lets_a_user_type_exactly_the_ones_i
 # --------------------------------------------------------------------------- #
 # what the season in progress can and cannot teach
 # --------------------------------------------------------------------------- #
-# Denominated in something the weekly results tables do not publish: routes run, red-zone and late-down
-# volume, rush successes, dropbacks, and the scramble/designed split. These keep their preseason estimate
-# all season and that is a data limit, not a bug -- the play-by-play rebuild is what closes them. Listed
-# rather than counted so that a rating quietly falling off the live side has to be acknowledged here.
+# The eight ratings a season in progress cannot teach, and the reason is one file rather than eight.
+#
+# Each is denominated in volume only the participation dataset locates -- which eleven men were on the
+# field, and therefore routes run, red-zone and late-down looks, and whether a carry was a success in its
+# situation. nflverse gets participation from FTN and publishes it only after a season has finished
+# (`nflreadpy.load_participation` caps its own season argument at `current_season - 1`), so the engine's
+# `routes`, `backfield` and `player_usage` tables do not exist for the current year no matter how many
+# weeks have been played. These eight therefore hold their preseason estimate until the offseason
+# rebuild. That is an upstream limit, not a queue and not a bug.
+#
+# Everything else does learn in season, including the ten quarterback rates the play-by-play detail in
+# `passer_games` and `team_games` supplies -- those two build fine without participation, which is why
+# `scripts/update_data.py` asks for exactly them. Listed rather than counted so that a rating quietly
+# falling off the live side has to be acknowledged here.
 WAITING = {
     "rz_target_share", "rz_carry_share", "inside_5_carry_share", "short_yardage_carry_share",
     "late_down_target_share", "route_participation", "tprr", "rush_success_rate",
-    "clean_rush_share", "yards_per_clean_rush", "dropback_share", "attempt_rate", "sack_rate",
-    "scramble_rate", "designed_rush_share", "designed_rush_ypc", "scramble_ypc", "qb_fumble_rate",
 }
 
 

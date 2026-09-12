@@ -562,11 +562,24 @@ def _update_panel() -> None:
     except ValueError:
         return
     mode = "full rebuild" if stamp.get("mode") == "full" else "refresh"
+    # How far the results the projection is standing on actually reach, which is the part of a refresh
+    # worth reading: a run that fetched eight tables successfully and still knows about no games has done
+    # nothing for the numbers on the board.
+    complete, played = stamp.get("weeks_complete") or 0, stamp.get("weeks_played") or 0
+    reach = f" · results through week {complete}" if played else ""
+    if played > complete:
+        reach += f", some teams {played}"
     if finished > _STARTED:
         st.warning(f"data {mode} finished {_clock(when)}, after this server started — restart it to "
                    "use the new numbers", icon="🔄")
     else:
-        st.caption(f"last data {mode} {when[:10]} {_clock(when)}")
+        st.caption(f"last data {mode} {when[:10]} {_clock(when)}{reach}")
+    # A failed heavy pass is worth saying out loud on every page: the light tables are current, so nothing
+    # looks stale, while the ratings denominated in play-by-play detail are quietly running a week behind.
+    heavy = str(stamp.get("heavy") or "")
+    if heavy.startswith("failed"):
+        st.caption(f"⚠ the play-by-play rebuild did not finish ({heavy}) — the quarterback dropback "
+                   f"ratings are a week behind the rest. See build/review/update.log")
 
 
 # --------------------------------------------------------------------------- #

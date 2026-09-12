@@ -71,6 +71,47 @@ def test_a_missing_engine_repo_skips_the_heavy_pass_and_says_so(update, tmp_path
     assert "src.data.refresh" in log, "the light pass must still run"
 
 
+def _fake_engine(tmp_path, monkeypatch, participation_seasons=()):
+    """An engine repo with the three scripts and whichever participation files it has been given."""
+    repo = tmp_path / "engine"
+    (repo / "scripts").mkdir(parents=True)
+    for script, *_ in _module().HEAVY:
+        (repo / script).write_text("")
+    for season in participation_seasons:
+        part = repo / "data" / "raw" / "participation" / f"season={season}"
+        part.mkdir(parents=True)
+        (part / "part.parquet").write_text("")
+    monkeypatch.setenv("NFLSP_ENGINE_DIR", str(repo))
+    return repo
+
+
+def test_a_season_with_no_participation_file_asks_only_for_the_tables_that_do_not_need_one(
+        update, tmp_path, monkeypatch):
+    """The bug this exists to prevent ran every week of last season and reported itself honestly.
+
+    `routes`, `backfield` and the `player_usage` built from them come from a participation dataset
+    published only after a season ends -- so mid-season `build_all` raised on the missing file, the chain
+    stopped, and the three tables that *were* buildable never got built. Asking for what is possible turns
+    a weekly `failed` into a weekly `ok (partial)`, and is the difference between the quarterback ratings
+    learning from the season and holding their August estimate until February.
+    """
+    _fake_engine(tmp_path, monkeypatch, participation_seasons=(2024,))
+    assert update.main(["--full", "--dry-run", "--season", "2026"]) == 0
+    log = _log(update)
+    assert "--tables team_games player_games passer_games" in log
+    assert "no participation file for 2026" in log
+    assert "routes, backfield and player_usage cannot be built" in log
+
+
+def test_the_full_chain_returns_the_week_the_participation_file_lands(update, tmp_path, monkeypatch):
+    """Asked of the disk rather than the calendar, so nobody has to remember to turn it back on."""
+    _fake_engine(tmp_path, monkeypatch, participation_seasons=(2024, 2025, 2026))
+    assert update.main(["--full", "--dry-run", "--season", "2026"]) == 0
+    log = _log(update)
+    assert "--tables" not in log, "with participation on disk, every aggregate can be built"
+    assert "build_aggregates.py --seasons 2026" in log
+
+
 def test_the_engine_repos_own_interpreter_is_preferred(update, tmp_path):
     bare = tmp_path / "bare"
     bare.mkdir()
@@ -124,6 +165,10 @@ def test_the_stamp_says_when_what_and_how_it_went(update, monkeypatch):
     (1, "skipped", 1),          # the preseason answer: nflreadpy refuses this season's injuries
     (2, "skipped", 2),          # rosters, depth charts or schedules missing
     (0, "failed at build_tables.py (1)", 2),
+    # mid-season the heavy pass cannot build the participation tables and does not pretend to try. That
+    # is the normal in-season result and must not be reported to the task scheduler as a failure, or the
+    # one week something is genuinely broken looks exactly like the twenty before it.
+    (0, "ok (partial)", 0),
 ])
 def test_the_exit_code_is_how_bad_it_was(update, monkeypatch, light, heavy, want):
     monkeypatch.setattr(update, "light_pass", lambda handle, season, dry: light)

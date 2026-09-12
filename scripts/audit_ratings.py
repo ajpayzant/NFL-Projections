@@ -184,12 +184,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{a.height} ratings · {a['found'].sum()} found · {a['editable'].sum()} knobs · "
           f"{a.filter(pl.col('spent') == 'unused').height} evidence · "
           f"{a['live'].sum()} can learn from the season in progress")
-    # Which ratings cannot, and why, because this is the honest limit rather than a to-do: routes run,
-    # red-zone volume and the scramble/designed split are play-by-play facts that arrive with the weekly
-    # rebuild, and a rating denominated in one of them keeps its preseason estimate all season.
+    # Which ratings cannot, and why, because this is the honest limit rather than a to-do. Each is
+    # denominated in volume only the participation dataset locates -- routes run, red-zone and late-down
+    # looks, a carry's success in its situation -- and nflverse publishes participation only once a season
+    # is over. So these keep their preseason estimate until the offseason rebuild no matter how many weeks
+    # have been played, which is an upstream fact and not a queue.
     waiting = a.filter(~pl.col("live") & pl.col("found"))["metric"].to_list()
     if waiting:
-        print(f"waiting on the weekly rebuild: {', '.join(waiting)}")
+        print(f"waiting on next year's participation release: {', '.join(waiting)}")
 
     found = findings(a)
     if not found:

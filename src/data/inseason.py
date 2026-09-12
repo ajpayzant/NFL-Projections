@@ -18,6 +18,12 @@ Three sources, because no one of them is enough:
                    quiet game, and the only measure of playing time there is
     team_stats     the team's own totals, so a team's results can be checked without summing players
 
+And two more, read only if they are there, because they arrive on the other repo's weekly schedule
+rather than within hours of a game: `passer_games` and `team_games` hold the dropback detail no weekly
+table publishes -- dropbacks, scrambles, designed runs and the yards on each -- and ten quarterback
+ratings are denominated in it. They are optional by construction: absent, the ratings that need them
+keep their preseason estimate and nothing else changes.
+
     python -m src.data.inseason              # what is complete, and a sample of it
     python -m src.data.inseason --week 2
 """
@@ -272,11 +278,12 @@ def team_pools(season: int = PROJ_SEASON) -> pl.DataFrame:
 #
 # The omissions are the point of the design and are deliberate rather than pending. Routes run, red-zone
 # targets, short-yardage carries, late-down targets and rush success are all play-by-play facts: nobody
-# publishes them within hours of a game, and they arrive when the pbp pipeline in the other repo rebuilds.
-# Nor are dropbacks here, though it is tempting -- `attempts + sacks` is a dropback count missing every
-# scramble, and feeding that in would quietly inflate every quarterback's attempt rate and sack rate and
-# deflate his share of his team's dropbacks. A metric denominated in dropbacks is better served by three
-# seasons of correct history than by two games of wrong arithmetic.
+# publishes them within hours of a game. Eight of them cannot be had at all until the season is over --
+# see `PBP_TO_DATE` below for why -- and the ten quarterback ratings denominated in dropbacks come from
+# the rebuilt tables when those are present, never reconstructed here. `attempts + sacks` is a dropback
+# count missing every scramble, and feeding that in would inflate every quarterback's attempt rate and
+# sack rate and deflate his share of his team's dropbacks. A metric denominated in dropbacks is better
+# served by three seasons of correct history than by two games of wrong arithmetic.
 #
 # A metric is fed from here only when *both* its numerator and its denominator are columns of this
 # frame, and `estimate.own_rate` enforces that rather than a list kept in step by hand. The check is not
@@ -310,6 +317,96 @@ TEAM_TO_DATE = {
     "qb": {"team_pass_attempts": "attempts", "team_carries": "carries",
            "team_pass_tds": "passing_tds", "team_rushing_tds": "rushing_tds"},
 }
+
+# --------------------------------------------------------------------------- #
+# and the dropback detail, when the other repo has rebuilt it
+# --------------------------------------------------------------------------- #
+# A dropback is not in any weekly table. It is a play-by-play fact -- did the quarterback intend to pass,
+# whatever he ended up doing -- and it is the denominator of a third of his ratings. So they are read from
+# `passer_games` and `team_games` when those hold the season in progress, which they do once the weekly
+# heavy pass has run, and left alone when they do not.
+#
+# Ten ratings turn on this: `dropback_share`, `attempt_rate`, `sack_rate`, `scramble_rate`,
+# `designed_rush_share`, `clean_rush_share`, `designed_rush_ypc`, `scramble_ypc`, `yards_per_clean_rush`
+# and `qb_fumble_rate`. The eight skill ratings denominated in red-zone, late-down or route volume are a
+# different case and are *not* here: those come from `player_usage`, which the other repo builds from an
+# FTN participation dataset published only after a season ends, so the current season cannot have them at
+# all. That is an upstream fact rather than a queue -- see `scripts/update_data.py`.
+#
+# history column -> the column of `passer_games` it is summed from. `rush_attempts_clean` and
+# `rush_yards_clean` are derived below exactly as `history.qb_weeks` derives them, from the same two
+# pairs, because a season-to-date row that defined "clean" differently from the seasons it is blended
+# with would be a different metric wearing the same name.
+QB_PBP = {"dropbacks": "dropbacks", "scrambles": "scrambles", "scramble_yards": "scramble_yards",
+          "designed_qb_rushes": "designed_qb_rushes",
+          "designed_qb_rush_yards": "designed_qb_rush_yards",
+          "qb_rushes": "qb_rushes", "qb_rush_yards": "qb_rush_yards", "kneels": "kneels"}
+
+# history column -> the column of `team_games` it is summed from. The two team pools that exist nowhere
+# in the weekly tables; the rest of a team's totals come from `team_stats` and are read the same week.
+TEAM_PBP = {"team_dropbacks": "dropbacks", "team_designed_rushes": "designed_rushes"}
+
+PBP_TO_DATE = {"skill": {}, "qb": QB_PBP}
+
+
+@lru_cache(maxsize=8)
+def qb_detail(season: int = PROJ_SEASON) -> pl.DataFrame:
+    """Dropbacks, scrambles and designed runs per quarterback per completed game.
+
+    From `passer_games`, which the other repo builds from play-by-play. Missing entirely before the first
+    heavy pass of a season and missing the newest week between one and the next, which is why every caller
+    treats it as optional rather than late: what is here is right, and what is not here is not guessed at.
+    """
+    empty = pl.DataFrame(schema={"player_id": pl.String, "team": pl.String, "week": pl.Int32,
+                                 **{c: pl.Float64 for c in QB_PBP},
+                                 "rush_attempts_clean": pl.Float64, "rush_yards_clean": pl.Float64})
+    try:
+        pg = _reg(lake.read("passer_games", seasons=(season,)))
+    except Exception:                       # noqa: BLE001 -- not rebuilt for this season yet
+        return empty
+    if pg.is_empty() or not {"player_id", "team", "week"} <= set(pg.columns):
+        return empty
+    have = {name: src for name, src in QB_PBP.items() if src in pg.columns}
+    out = pg.select(
+        pl.col("player_id").cast(pl.String),
+        pl.col("team").cast(pl.String),
+        pl.col("week").cast(pl.Int32),
+        *[pl.col(src).cast(pl.Float64).fill_null(0.0).alias(name) for name, src in have.items()],
+    ).group_by(["player_id", "week"]).agg(pl.col("team").last(), pl.all().exclude("team").sum())
+    # the projectable rush, as `history.qb_weeks` defines it: designed runs plus scrambles, kneels out.
+    # A kneeldown is not football a projection should extrapolate from.
+    parts = [("rush_attempts_clean", "designed_qb_rushes", "scrambles"),
+             ("rush_yards_clean", "designed_qb_rush_yards", "scramble_yards")]
+    return out.with_columns([
+        (pl.col(a).fill_null(0.0) + pl.col(b).fill_null(0.0)).alias(name)
+        for name, a, b in parts if a in out.columns and b in out.columns
+    ])
+
+
+@lru_cache(maxsize=8)
+def team_detail(season: int = PROJ_SEASON) -> pl.DataFrame:
+    """The two team pools only the play-by-play knows: dropbacks, and designed runs.
+
+    Read off `team_games` rather than summed from the quarterbacks for the same reason `team_pools` is
+    read off `team_stats`: a team's dropbacks are a team fact, and a wildcat snap by a receiver belongs in
+    the denominator of every passer's share of it.
+    """
+    empty = pl.DataFrame(schema={"team": pl.String, "week": pl.Int32,
+                                 **{c: pl.Float64 for c in TEAM_PBP}})
+    try:
+        tg = _reg(lake.read("team_games", seasons=(season,)))
+    except Exception:                       # noqa: BLE001
+        return empty
+    if tg.is_empty() or not {"team", "week"} <= set(tg.columns):
+        return empty
+    have = {name: src for name, src in TEAM_PBP.items() if src in tg.columns}
+    if not have:
+        return empty
+    return tg.select(
+        pl.col("team").cast(pl.String),
+        pl.col("week").cast(pl.Int32),
+        *[pl.col(src).cast(pl.Float64).fill_null(0.0).alias(name) for name, src in have.items()],
+    ).group_by(["team", "week"]).agg(pl.all().sum()).sort(["team", "week"])
 
 
 @lru_cache(maxsize=8)
@@ -349,11 +446,24 @@ def to_date(table: str, season: int = PROJ_SEASON) -> pl.DataFrame:
     by the opportunity in it, so two games of a receiver's targets carry two games of weight and grow into
     real evidence by November without anybody choosing a schedule for it.
 
-    Only the columns in `SKILL_TO_DATE`/`QB_TO_DATE` and their team denominators, plus `touches` and
-    `games`. A metric that needs a column not here keeps its preseason estimate -- see the note above
-    those dicts, which is where the honest limits of the live tables are written down.
+    Only the columns in `SKILL_TO_DATE`/`QB_TO_DATE`, the dropback detail in `QB_PBP` where the rebuilt
+    tables have it, their team denominators, plus `touches` and `games`. A metric that needs a column not
+    here keeps its preseason estimate -- see the notes above those dicts, which is where the honest limits
+    of the live tables are written down.
+
+    Everything is joined at the *(team, week)* grain and grouped once, which is what makes a share
+    comparable to the same share in a season of history: `history.skill_seasons` sums the team totals
+    carried on the player's own game rows, so its `team_targets` is the pool he was present for and not his
+    team's whole season. Summed the other way a man who missed a game would have his share divided by an
+    offence he was not on the field for, and would read as having lost his job.
+
+    The dropback detail is used only over the weeks it and the weekly tables both cover, and dropped
+    entirely when it is missing. Between Sunday's games and the next heavy pass that means a quarterback's
+    live evidence stops a week short rather than half of it being measured over one game and half over two:
+    a rate whose two sides count different games is not a rate.
     """
     cols = SKILL_TO_DATE if table == "skill" else QB_TO_DATE
+    pbp = PBP_TO_DATE["skill" if table == "skill" else "qb"]
     schema: dict[str, pl.DataType] = {
         "player_id": pl.String, "season": pl.Int32, "team": pl.String, "games": pl.Float64,
         **{c: pl.Float64 for c in cols},
@@ -361,43 +471,57 @@ def to_date(table: str, season: int = PROJ_SEASON) -> pl.DataFrame:
     pw = player_weeks(season)
     if pw.is_empty():
         return pl.DataFrame(schema=schema)
-
-    have = {name: mine for name, mine in cols.items() if mine in pw.columns}
-    per_player = (
-        pw.filter(pl.col("played") > 0)
-        .group_by("player_id")
-        .agg(
-            pl.col("team").last(),
-            pl.col("week").n_unique().cast(pl.Float64).alias("games"),
-            *[pl.col(mine).sum().alias(name) for name, mine in have.items()],
-        )
-    )
-    if per_player.is_empty():
+    rows = pw.filter(pl.col("played") > 0)
+    if rows.is_empty():
         return pl.DataFrame(schema=schema)
+
+    detail, tdet = (qb_detail(season), team_detail(season)) if pbp else (pl.DataFrame(), pl.DataFrame())
+    use_pbp = bool(pbp) and not detail.is_empty() and not tdet.is_empty()
+    if use_pbp:
+        rows = rows.join(tdet.select("team", "week"), on=["team", "week"], how="semi")
+        if rows.is_empty():
+            return pl.DataFrame(schema=schema)
+        rows = rows.join(detail.drop("team"), on=["player_id", "week"], how="left")
+        rows = rows.join(tdet, on=["team", "week"], how="left")
+        # A quarterback with no `passer_games` row in a game the play-by-play does cover took a snap
+        # nobody charted as a dropback -- a wildcat handoff, a holder's throw. `history.qb_weeks` fills
+        # that with attempts plus sacks and this has to fill it the same way, or his rate is measured
+        # against a zero he did not earn.
+        if {"dropbacks", "attempts", "sacks"} <= set(rows.columns):
+            rows = rows.with_columns(pl.col("dropbacks").fill_null(
+                pl.col("attempts").fill_null(0.0) + pl.col("sacks").fill_null(0.0)))
+
+    pools = TEAM_TO_DATE["skill" if table == "skill" else "qb"]
+    tp, ts = team_pools(season), team_snaps(season)
+    keep = {name: src for name, src in pools.items() if src in tp.columns}
+    if keep and not tp.is_empty():
+        rows = rows.join(
+            tp.select("team", "week", *[pl.col(src).alias(name) for name, src in keep.items()]),
+            on=["team", "week"], how="left",
+        )
+    if not ts.is_empty():
+        rows = rows.join(ts, on=["team", "week"], how="left")
+
+    have = {name: mine for name, mine in cols.items() if mine in rows.columns}
+    extra = [c for c in (*pbp, "rush_attempts_clean", "rush_yards_clean", *TEAM_PBP,
+                         *pools, "team_offense_snaps") if c in rows.columns]
+    per_player = rows.group_by("player_id").agg(
+        pl.col("team").last(),
+        pl.col("week").n_unique().cast(pl.Float64).alias("games"),
+        *[pl.col(mine).sum().alias(name) for name, mine in have.items()],
+        *[pl.col(c).sum() for c in extra],
+    )
     # what `fumble_rate` divides by: a carry or a catch is a chance to put it on the floor
     if {"carries", "receptions"} <= set(per_player.columns):
         per_player = per_player.with_columns(
             (pl.col("carries") + pl.col("receptions")).alias("touches")
         )
-
-    # every team pool these metrics divide, summed over the games that team has played -- so a share is
-    # measured against the same number of games it was earned in, and a team on a bye is not diluted
-    pools = TEAM_TO_DATE["skill" if table == "skill" else "qb"]
-    tp, ts = team_pools(season), team_snaps(season)
-    team = pl.DataFrame(schema={"team": pl.String})
-    agg = [pl.col(src).sum().alias(name) for name, src in pools.items() if src in tp.columns]
-    if agg and not tp.is_empty():
-        team = tp.group_by("team").agg(*agg)
-    if not ts.is_empty():
-        snap_pool = ts.group_by("team").agg(pl.col("team_offense_snaps").sum())
-        team = snap_pool if team.is_empty() else team.join(snap_pool, on="team", how="left")
-
-    out = per_player.join(team, on="team", how="left") if team.height else per_player
-    return out.with_columns(pl.lit(season, pl.Int32).alias("season"))
+    return per_player.with_columns(pl.lit(season, pl.Int32).alias("season"))
 
 
 def clear_cache() -> None:
-    for fn in (team_weeks, player_weeks, snaps, crosswalk, team_pools, team_snaps, to_date):
+    for fn in (team_weeks, player_weeks, snaps, crosswalk, team_pools, team_snaps,
+               qb_detail, team_detail, to_date):
         fn.cache_clear()
 
 

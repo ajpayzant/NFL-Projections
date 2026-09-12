@@ -156,10 +156,11 @@ def test_a_metric_is_fed_only_when_both_halves_of_its_ratio_are_measured() -> No
     his sack rate as having doubled -- an accuracy loss dressed up as fresher data. Both sides or
     neither, decided by what is in the frame rather than by a list kept in step by hand.
 
-    The refusals are real limits and are named here so they cannot be quietly lost: routes run, red-zone
-    and short-yardage volume, the scramble/designed split and anything denominated in dropbacks are
-    play-by-play facts that arrive when the other repo rebuilds, not within hours of a game. Those
-    metrics keep their preseason estimate all season, which is the honest answer and not a good one.
+    The refusals are real limits and are named here so they cannot be quietly lost: routes run and
+    red-zone, late-down and short-yardage volume are participation facts, and participation is published
+    only after a season ends. Those eight keep their preseason estimate all season, which is the honest
+    answer and not a good one. Everything a weekly table or the play-by-play in `passer_games` can
+    measure -- the quarterback's dropbacks and the scramble/designed split included -- is expected live.
     """
     st = Settings()
     live = {m.name for m in priors.METRICS if estimate.to_date(m, PROJ_SEASON, st) is not None}
@@ -171,14 +172,159 @@ def test_a_metric_is_fed_only_when_both_halves_of_its_ratio_are_measured() -> No
         assert float(cur[m.den].min()) > 0, m.name
     if not live:
         return                              # before kickoff there is nothing to feed anything
-    # the ones the weekly tables genuinely cannot close, which must never appear
+    # the ones no weekly table and no play-by-play rebuild of the current season can close
     assert not live & {"route_participation", "tprr", "rz_target_share", "rz_carry_share",
                        "late_down_target_share", "short_yardage_carry_share", "inside_5_carry_share",
-                       "rush_success_rate", "scramble_rate", "scramble_ypc", "designed_rush_ypc",
-                       "dropback_share", "attempt_rate", "sack_rate", "qb_fumble_rate",
-                       "clean_rush_share", "yards_per_clean_rush", "designed_rush_share"}
-    # and the ones it can, which are the point of the exercise
+                       "rush_success_rate"}
+    # and the ones they can, which are the point of the exercise
     assert {"target_share", "carry_share", "snap_share", "catch_rate", "yards_per_target"} <= live
+    # the quarterback's half of that, which only exists because `to_date` reads the pbp aggregates too
+    if not inseason.qb_detail(PROJ_SEASON).is_empty():
+        assert {"dropback_share", "attempt_rate", "sack_rate", "scramble_rate", "designed_rush_share",
+                "scramble_ypc", "designed_rush_ypc", "qb_fumble_rate"} <= live
+
+
+# --------------------------------------------------------------------------- #
+# the dropback detail, and the grain everything is joined at
+# --------------------------------------------------------------------------- #
+def test_the_dropback_detail_is_one_row_a_game_and_clean_means_what_history_means() -> None:
+    """`qb_detail` against the definition `history.qb_weeks` uses, because they are blended together.
+
+    A season-to-date row that counted kneeldowns as rushes, or scrambles as designed runs, would be a
+    different metric wearing the same name as the three seasons it is averaged with -- and the error would
+    look like a quarterback who had suddenly started running.
+    """
+    d = inseason.qb_detail(PROJ_SEASON)
+    if d.is_empty():
+        return                              # no heavy pass has run for this season yet
+    assert d.select(["player_id", "week"]).is_unique().all()
+    for col in inseason.QB_PBP:
+        if col in d.columns:
+            assert float(d[col].min()) >= 0.0, col
+    if {"rush_attempts_clean", "designed_qb_rushes", "scrambles"} <= set(d.columns):
+        clean = d["designed_qb_rushes"] + d["scrambles"]
+        assert (d["rush_attempts_clean"] - clean).abs().max() < 1e-9
+        # a box-score carry is a designed run, a scramble or a kneel; the engine's `qb_rushes` is the
+        # first two of those, so clean has to agree with it exactly and not merely fall short of carries
+        if "qb_rushes" in d.columns:
+            assert (d["qb_rushes"] - clean).abs().max() < 1e-9
+    if {"dropbacks", "scrambles"} <= set(d.columns):
+        assert float((d["dropbacks"] - d["scrambles"]).min()) >= -1e-9
+
+
+def test_a_teams_dropbacks_are_a_team_fact_and_hold_every_passer_on_it() -> None:
+    """`team_detail` read off `team_games`, not summed from the quarterbacks.
+
+    Same reason as `team_pools`: a wildcat snap by a receiver is a dropback the offence spent, so it
+    belongs in the denominator of every passer's share of it. Summing the passers would leave the shares
+    on a team with a trick play adding to more than one.
+    """
+    td = inseason.team_detail(PROJ_SEASON)
+    if td.is_empty():
+        return
+    assert td.select(["team", "week"]).is_unique().all()
+    # a team drops back between roughly fifteen and eighty times in a game
+    assert float(td["team_dropbacks"].min()) >= 15.0
+    assert float(td["team_dropbacks"].max()) <= 80.0
+    qb = inseason.qb_detail(PROJ_SEASON)
+    if qb.is_empty() or "dropbacks" not in qb.columns:
+        return
+    mine = qb.join(td, on=["team", "week"], how="inner").group_by(["team", "week"]).agg(
+        pl.col("dropbacks").sum(), pl.col("team_dropbacks").first())
+    assert float((mine["team_dropbacks"] - mine["dropbacks"]).min()) >= -1e-9
+
+
+def test_the_team_pool_a_share_divides_is_the_one_he_was_present_for() -> None:
+    """A share is measured over the games the player was on the field for, and nothing else.
+
+    `history.skill_seasons` sums the team totals carried on the player's own game rows, so its
+    `team_targets` is the pool he was present for rather than his team's whole season. The season to date
+    has to match that or the two are not comparable: divide a man's four targets in the one game he played
+    by his offence's sixty over three, and he reads as having lost his job.
+
+    Built by hand so it can be checked on a player who missed a game, which the calendar may not offer
+    yet, and so the arithmetic is checked rather than the frames agreeing with each other.
+    """
+    pw = pl.DataFrame({
+        "player_id": ["a", "a", "b"], "team": ["KC"] * 3, "week": [1, 2, 2],
+        "played": [1.0, 1.0, 1.0], "targets": [10.0, 8.0, 4.0], "offense_snaps": [50.0, 45.0, 20.0],
+    })
+    tp = pl.DataFrame({"team": ["KC", "KC"], "week": [1, 2], "targets": [40.0, 30.0]})
+    got = _to_date_over("skill", 1901, pw, tp)
+    row = {r["player_id"]: r for r in got.to_dicts()}
+    assert row["a"]["games"] == 2.0
+    assert row["a"]["targets"] == 18.0
+    assert row["a"]["team_targets"] == 70.0        # both weeks, because he played both
+    assert row["b"]["games"] == 1.0
+    assert row["b"]["targets"] == 4.0
+    assert row["b"]["team_targets"] == 30.0        # week 2 only, not the 70 his offence ran all year
+
+
+def test_the_dropback_detail_is_used_only_over_the_weeks_it_and_the_weekly_tables_share() -> None:
+    """Between Sunday's games and the next heavy pass, half a quarterback's rates would count two games
+    and half of them one. A rate whose two sides count different games is not a rate.
+
+    So the detail is not merely joined -- the weeks it does not cover are dropped from the frame
+    altogether. His live evidence stops a week short, which is a week of freshness given up to keep the
+    ratios honest, and the alternative is an attempt rate computed over one game's attempts and two games'
+    dropbacks.
+    """
+    pw = pl.DataFrame({
+        "player_id": ["q", "q"], "team": ["KC", "KC"], "week": [1, 2], "played": [1.0, 1.0],
+        "attempts": [30.0, 25.0], "sacks": [2.0, 1.0], "offense_snaps": [60.0, 55.0],
+    })
+    tp = pl.DataFrame({"team": ["KC", "KC"], "week": [1, 2], "attempts": [30.0, 25.0]})
+    qb = pl.DataFrame({"player_id": ["q"], "team": ["KC"], "week": [1], "dropbacks": [34.0],
+                       "scrambles": [2.0]})
+    td = pl.DataFrame({"team": ["KC"], "week": [1], "team_dropbacks": [36.0]})
+    got = _to_date_over("qb", 1902, pw, tp, qb, td).to_dicts()[0]
+    assert got["games"] == 1.0                     # week 2 is dropped, not half-measured
+    assert got["attempts"] == 30.0
+    assert got["dropbacks"] == 34.0
+    assert got["team_pass_attempts"] == 30.0
+    assert got["team_dropbacks"] == 36.0
+
+
+def test_a_passer_the_play_by_play_has_no_row_for_still_gets_a_denominator() -> None:
+    """`attempts + sacks` is a dropback count missing every scramble -- for a quarterback it is the wrong
+    number and the module refuses it. For a man who is not one it is exactly right.
+
+    The receiver who throws the week's trick pass has no row in `passer_games`, and leaving his dropbacks
+    null would divide his one attempt by nothing. He drops back as often as he throws or is sacked, which
+    is what this fills, and it is a fallback for the null rather than a substitute for the real column.
+    """
+    pw = pl.DataFrame({
+        "player_id": ["q", "wr"], "team": ["KC", "KC"], "week": [1, 1], "played": [1.0, 1.0],
+        "attempts": [30.0, 1.0], "sacks": [2.0, 0.0], "offense_snaps": [60.0, 50.0],
+    })
+    tp = pl.DataFrame({"team": ["KC"], "week": [1], "attempts": [31.0]})
+    qb = pl.DataFrame({"player_id": ["q"], "team": ["KC"], "week": [1], "dropbacks": [34.0]})
+    td = pl.DataFrame({"team": ["KC"], "week": [1], "team_dropbacks": [35.0]})
+    row = {r["player_id"]: r for r in _to_date_over("qb", 1903, pw, tp, qb, td).to_dicts()}
+    assert row["q"]["dropbacks"] == 34.0           # the real column wins where there is one
+    assert row["wr"]["dropbacks"] == 1.0           # one attempt, no sack, no scramble
+
+
+def _to_date_over(table: str, season: int, pw: pl.DataFrame, tp: pl.DataFrame,
+                  qb: pl.DataFrame | None = None, td: pl.DataFrame | None = None) -> pl.DataFrame:
+    """`to_date` over frames built by hand instead of read from the lake.
+
+    A fake season number rather than `PROJ_SEASON` because `to_date` is memoised on its arguments, and
+    the sources are swapped by name because that is how `to_date` reaches them.
+    """
+    empty = pl.DataFrame()
+    subs = {"player_weeks": pw, "team_pools": tp, "team_snaps": empty,
+            "qb_detail": qb if qb is not None else empty,
+            "team_detail": td if td is not None else empty}
+    saved = {name: getattr(inseason, name) for name in subs}
+    try:
+        for name, frame in subs.items():
+            setattr(inseason, name, lambda season=None, _f=frame: _f)
+        return inseason.to_date(table, season)
+    finally:
+        for name, fn in saved.items():
+            setattr(inseason, name, fn)
+        inseason.clear_cache()
 
 
 def test_a_finished_season_never_sees_itself() -> None:

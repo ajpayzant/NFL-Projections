@@ -21,6 +21,11 @@ Two speeds, because the data has two speeds:
   script does not reimplement any of it; if that repo is not on this machine the heavy pass is skipped
   with a line in the log and the light pass still runs.
 
+  Mid-season the heavy pass is deliberately partial: three of those tables are derived from a
+  participation file nflverse only publishes once a season is over, so asking for them fails the chain
+  and leaves the three that *are* buildable unbuilt. `IN_SEASON_TABLES` below is the honest list, and
+  the run reports `ok (partial)` rather than the `failed` it used to report every week of the year.
+
 Everything is appended to `build/review/update.log` and the finish is stamped into
 `build/review/last_update.json`, which the app's sidebar reads: `st.cache_data` lives in the server
 process, so a server that was already running when this ran keeps serving the old frames until it is
@@ -59,6 +64,22 @@ HEAVY = (
     ("scripts/build_aggregates.py",),
 )
 
+# The derived tables that need no participation file, which is all of them except `routes`, `backfield`
+# and the `player_usage` built from those two.
+#
+# Participation -- which eleven men were on the field for a play -- comes to nflverse from FTN and is
+# published only after a season has finished: `nflreadpy.load_participation` caps its own season argument
+# at `current_season - 1` and says so in a comment. So for the season in progress those three tables
+# cannot be built at all, and asking for them does not merely skip them: `build_all` raises on the missing
+# file and the whole chain stops, which is how a weekly refresh comes to report "failed at
+# build_aggregates" every week of the year and how the three tables that *can* be built never get built.
+#
+# Asking only for what is possible is the difference between a pass that reports a real failure and one
+# that cries wolf. What it costs is the eight skill ratings denominated in route, red-zone and late-down
+# volume -- they keep their preseason estimate until the offseason rebuild, and `src/data/inseason.py`
+# says so beside the ten quarterback ratings these three tables do close.
+IN_SEASON_TABLES = ("team_games", "player_games", "passer_games")
+
 
 def engine_dir() -> Path:
     return Path(os.environ.get("NFLSP_ENGINE_DIR", Path.home() / "nfl-projection-system"))
@@ -93,18 +114,37 @@ def run(handle, cmd: list[str], cwd: Path, dry: bool) -> int:
     return done.returncode
 
 
+def has_participation(repo: Path, season: int) -> bool:
+    """Is there a participation file for this season yet?
+
+    Asked of the disk rather than assumed from the calendar, so that the week FTN publishes last season
+    the full chain resumes on its own -- and so a machine that has the file for a season already gets
+    the routes tables rebuilt even if that season is nominally the projection season.
+    """
+    return any((repo / "data" / "raw" / "participation").glob(f"season={season}/*.parquet"))
+
+
 def heavy_pass(handle, season: int, dry: bool) -> str:
     repo = engine_dir()
     if not (repo / HEAVY[0][0]).exists():
         say(handle, f"heavy: no engine repo at {repo} -- skipped, the played-game tables stay as they are")
         return "no engine repo"
     py = python_for(repo)
+    limited = not has_participation(repo, season)      # asked on a dry run too, so it prints the truth
+    if limited:
+        say(handle, f"heavy: no participation file for {season} yet, so routes, backfield and "
+                    f"player_usage cannot be built -- asking build_aggregates for "
+                    f"{', '.join(IN_SEASON_TABLES)} only. The eight route/red-zone/late-down skill "
+                    f"ratings keep their preseason estimate; everything else still learns from the "
+                    f"weeks played.")
     for script, *flags in HEAVY:
+        if limited and script.endswith("build_aggregates.py"):
+            flags = [*flags, "--tables", *IN_SEASON_TABLES]
         code = run(handle, [py, script, *flags, "--seasons", str(season)], repo, dry)
         if code != 0:
             say(handle, f"heavy: {script} failed -- stopping the chain, the later steps read its output")
             return f"failed at {Path(script).name} ({code})"
-    return "ok"
+    return "ok (partial)" if limited else "ok"
 
 
 def light_pass(handle, season: int, dry: bool) -> int:
