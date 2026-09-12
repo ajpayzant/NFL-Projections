@@ -5,12 +5,20 @@ injuries. They are small, they change daily in season, and a projection built on
 wrong in a way that no amount of modelling fixes -- so this project fetches them itself rather than
 waiting on the pbp pipeline that owns the heavy played-game tables.
 
+Three more decide what has already happened: `player_stats`, `snap_counts` and `team_stats`, the weekly
+results. They are here for the same reason and a sharper one. The heavy `processed/` tables carry five
+years of history and are rebuilt on the other repo's schedule, which is right for history and hopeless
+for last Sunday -- so through August 2026 the app had no way to know the season had started, and would
+have projected week 1 from priors in December. These three are published within hours of a game.
+`src/data/inseason.py` reads them; `compose.actualise` spends them.
+
 Writes to `OWN_RAW/<dataset>/season=<year>/<dataset>.parquet`, which `lake.read` prefers over the
 shared copy. Nothing here touches `processed/`.
 
     python -m src.data.refresh                    # the projection season
     python -m src.data.refresh --seasons 2025 2026
     python -m src.data.refresh --check            # what is on disk, fetch nothing
+    python -m src.data.refresh --datasets player_stats snap_counts team_stats
 """
 
 from __future__ import annotations
@@ -33,7 +41,16 @@ SOURCES: dict[str, tuple[str, bool]] = {
     "schedules": ("load_schedules", True),
     "injuries": ("load_injuries", True),
     "draft_picks": ("load_draft_picks", True),
+    # results to date, which is what makes an in-season projection an in-season projection
+    "player_stats": ("load_player_stats", True),
+    "snap_counts": ("load_snap_counts", True),
+    "team_stats": ("load_team_stats", True),
 }
+
+# Tables that are empty until the season starts, and whose emptiness in August is not a failure. Kept
+# apart from the essential three so a missing week-1 stat line in July does not report as a broken
+# refresh, and so that `main` can still say the season has not begun rather than nothing.
+RESULTS = ("player_stats", "snap_counts", "team_stats")
 
 
 def _loader(name: str):
@@ -140,7 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     for (dataset, season), outcome in sorted(results.items()):
         print(f"  {dataset:<14} {season}  {outcome}")
-        if missed(outcome):
+        # A results table with nothing in it is a season that has not kicked off, not a broken fetch.
+        # Reported, because "no games yet" is worth reading, and not counted, because in July it is true.
+        if missed(outcome) and not (dataset in RESULTS and outcome == "empty upstream"):
             failed += 1
     # Rosters and depth charts are the two that change who gets projected at all. An empty
     # schedule in August is a broken fetch, not a quiet season -- so any miss on these is an error.

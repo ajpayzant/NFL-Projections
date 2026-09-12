@@ -208,21 +208,8 @@ with avail_tab:
 # --------------------------------------------------------------------------- #
 # 3. the rooms — one man at a time, with the sheet behind him
 # --------------------------------------------------------------------------- #
-INPUTS = {
-    "QB": ("dropback_share", "pass_td_share", "designed_rush_share", "qb_rush_td_share",
-           "attempt_rate", "completion_pct", "yards_per_attempt", "pass_td_rate", "int_rate",
-           "sack_rate", "scramble_rate", "yards_per_clean_rush"),
-    "RB": ("carry_share", "clean_rush_share", "rz_carry_share", "inside_5_carry_share",
-           "short_yardage_carry_share", "target_share", "rush_td_share", "rec_td_share",
-           "yards_per_carry", "rush_success_rate", "catch_rate", "yards_per_target"),
-    "WR": ("target_share", "air_yards_share", "rz_target_share", "late_down_target_share",
-           "rec_td_share", "catch_rate", "yards_per_target", "adot", "tprr"),
-    "TE": ("target_share", "air_yards_share", "rz_target_share", "rec_td_share", "catch_rate",
-           "yards_per_target", "adot", "tprr"),
-}
-
-# The one number a room is really argued about, and therefore the evidence the sheet opens with.
-HEADLINE = {"QB": "dropback_share", "RB": "carry_share", "WR": "target_share", "TE": "target_share"}
+INPUTS = ui.ROOM_INPUTS
+HEADLINE = ui.ROOM_HEADLINE
 
 # The room list: enough to choose a man by, and no more. His numbers are the panel beside it.
 ROOM_LIST = ["depth_slot", "player", "status", "expected_games", "pool_share", "position_rank",
@@ -302,7 +289,12 @@ with rooms_tab:
             # `obs`/`n` are his own record and how much of it there is, `prior` is what the job is worth,
             # and the year columns are the five seasons as a line. One metric at a time, because five
             # evidence columns for a dozen metrics is a sheet nobody can read.
-            choices = ["nothing", *(c for c in want if c in overrides.PLAYER_FIELDS)]
+            # Read off the sheet rather than off `INPUTS`, so the metrics a user can see the evidence for
+            # are exactly the ones the grid below lets him type: `snap_share` and `expected_games` reach
+            # this frame from the participation select rather than from the room list, and they are his
+            # playing time -- the top knob for three of the four rooms and the second for the fourth.
+            # Deriving both lists from one set is why a knob cannot arrive without its record.
+            choices = ["nothing", *(c for c in marked.columns if c in overrides.PLAYER_FIELDS)]
             first = HEADLINE.get(pos, "")
             beside = st.selectbox(
                 "Show the evidence for", choices,

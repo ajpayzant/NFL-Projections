@@ -78,7 +78,6 @@ SKILL_METRICS = (
     Metric("rush_td_share", "rushing_tds", "team_rushing_tds", "skill", "share"),
     Metric("snap_share", "offense_snaps", "team_offense_snaps", "skill", "share", since=PARTICIPATION_FROM),
     Metric("route_participation", "routes", "team_dropbacks", "skill", "share", since=PARTICIPATION_FROM),
-    Metric("rush_participation", "rush_plays", "team_designed_rushes", "skill", "share", since=PARTICIPATION_FROM),
     Metric("catch_rate", "receptions", "targets", "skill", "rate", monotone_in_pick=False),
     Metric("yards_per_target", "receiving_yards", "targets", "skill", "rate", monotone_in_pick=False),
     Metric("yards_per_carry", "rushing_yards", "carries", "skill", "rate", monotone_in_pick=False),
@@ -113,6 +112,10 @@ QB_METRICS = (
     # the same pool the skill players' `rush_td_share` divides, so the two normalize together
     Metric("qb_rush_td_share", "rushing_tds", "team_rushing_tds", "qb", "share"),
     Metric("qb_fumble_rate", "fumbles_lost", "dropbacks", "qb", "rate", monotone_in_pick=False),
+    # The same pool the skill players' `snap_share` divides, so the two normalize together. A starting
+    # quarterback's share is ~0.96 and a backup's is near zero, which is close to a step function --
+    # so this is the one share where the depth slot, not the player's own history, carries the answer.
+    Metric("qb_snap_share", "offense_snaps", "team_offense_snaps", "qb", "share"),
 )
 
 METRICS = SKILL_METRICS + QB_METRICS
@@ -213,11 +216,19 @@ def group_prior(metric: Metric, hist_slots: pl.DataFrame, before: int) -> pl.Dat
     h = hist_slots.filter((pl.col("season") < before) & (pl.col("season") >= metric.since))
     if h.is_empty():
         return pl.DataFrame(schema={"position": pl.String, "slot_bucket": pl.Int32, "prior": pl.Float64})
+    # A row whose numerator was never measured contributes to neither side. Without the guard on the
+    # denominator, `sum()` reads a column of nulls as zero and the ratio comes out a confident 0.000
+    # against a full season of opportunity. That is how `rush_participation` -- since removed, because it
+    # was a duplicate of `carry_share` and measured for backs alone -- came to have a fitted prior of
+    # exactly zero for every receiver in the league, stated over 55,000 designed runs. No metric left is
+    # partial in that way, so this changes nothing today; it is here so the next one cannot repeat it.
+    num, den = pl.col(metric.num), pl.col(metric.den)
+    paired = pl.when(num.is_not_null()).then(den).otherwise(None)
     grp = h.group_by(["position", "slot_bucket"]).agg(
-        pl.col(metric.num).sum().alias("num"), pl.col(metric.den).sum().alias("den")
+        num.sum().alias("num"), paired.sum().alias("den")
     )
     pos = h.group_by("position").agg(
-        pl.col(metric.num).sum().alias("pnum"), pl.col(metric.den).sum().alias("pden")
+        num.sum().alias("pnum"), paired.sum().alias("pden")
     )
     return (
         grp.join(pos, on="position", how="left")

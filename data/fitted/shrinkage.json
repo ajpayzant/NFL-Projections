@@ -1,5 +1,5 @@
 {
-  "fitted_at": "2026-08-24T01:43:58+00:00",
+  "fitted_at": "2026-09-12T01:43:26+00:00",
   "history": [
     2016,
     2025
@@ -23,7 +23,6 @@
     "rush_td_share": 5.0,
     "snap_share": 60.0,
     "route_participation": 35.0,
-    "rush_participation": 20.0,
     "catch_rate": 35.0,
     "yards_per_target": 100.0,
     "yards_per_carry": 160.0,
@@ -47,6 +46,7 @@
     "scramble_ypc": 60.0,
     "designed_rush_ypc": 2.0,
     "qb_rush_td_share": 5.0,
-    "qb_fumble_rate": 1000.0
+    "qb_fumble_rate": 1000.0,
+    "qb_snap_share": 1000.0
   }
 }

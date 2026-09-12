@@ -53,7 +53,6 @@ YARD_SHARES = {
 PARTICIPATION = {
     "snap_share": ("offense_snaps", "team_offense_snaps"),
     "route_participation": ("routes", "team_dropbacks"),
-    "rush_participation": ("rush_plays", "team_designed_rushes"),
     "late_down_route_participation": ("late_down_routes", "team_late_down_dropbacks"),
     "two_minute_route_participation": ("two_minute_routes", "team_two_minute_dropbacks"),
 }
@@ -244,7 +243,7 @@ def skill_seasons(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
     sw = skill_weeks(seasons)
     counts = [
         "targets", "receptions", "receiving_yards", "receiving_tds", "receiving_air_yards",
-        "carries", "rushing_yards", "rushing_tds", "routes", "offense_snaps", "rush_plays",
+        "carries", "rushing_yards", "rushing_tds", "routes", "offense_snaps",
         "rz_targets", "rz_carries", "inside_5_carries", "inside_5_targets",
         "short_yardage_carries", "late_down_targets", "late_down_routes", "two_minute_routes",
         "rush_successes", "receiving_first_downs", "rushing_first_downs",
@@ -344,6 +343,10 @@ def qb_seasons(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
         "rushing_fumbles_lost", "receiving_fumbles_lost", "fantasy_points",
         "team_pass_attempts", "team_dropbacks", "team_carries", "team_designed_rushes",
         "team_pass_tds", "team_rushing_tds", "team_offensive_tds", "team_plays",
+        # A quarterback's snaps were being dropped here while `qb_weeks` carried them on every row,
+        # which is why the projection had no snap count for the one position that never leaves the
+        # field. Summed like any other count so the share below is opportunity-weighted.
+        "offense_snaps", "team_offense_snaps",
     ]
     have = [c for c in counts if c in qw.columns]
     agg = qw.group_by(["player_id", "season"]).agg(
@@ -362,6 +365,7 @@ def qb_seasons(seasons: tuple[int, ...] | None = None) -> pl.DataFrame:
             "designed_yards_per_rush": ("designed_qb_rush_yards", "designed_qb_rushes"),
             "yards_per_clean_rush": ("rush_yards_clean", "rush_attempts_clean"),
             "clean_rush_share": ("rush_attempts_clean", "team_carries"),
+            "qb_snap_share": ("offense_snaps", "team_offense_snaps"),
         },
     ).with_columns(
         pl.lit("QB").alias("position"),

@@ -62,8 +62,9 @@ ui.tiles([
      "sub": f"picked straight up · Brier {fit['brier']:.3f}"},
 ])
 
-TABS = ["🏆 Standings", "📊 All 32 offences", "🗓️ Every game", "✅ How far through the league"]
-standings_tab, teams_tab, games_tab, coverage_tab = st.tabs(TABS)
+TABS = ["🏆 Standings", "📊 All 32 offences", "🗓️ Every game", "💰 Against the posted lines",
+        "✅ How far through the league"]
+standings_tab, teams_tab, games_tab, market_tab, coverage_tab = st.tabs(TABS)
 
 # --------------------------------------------------------------------------- #
 # 1. the standings
@@ -277,7 +278,102 @@ with games_tab:
             "record is still seventeen games.")
 
 # --------------------------------------------------------------------------- #
-# 4. how far through the league
+# 4. against the posted lines
+# --------------------------------------------------------------------------- #
+# A sanity check, and deliberately only that. No player's stat line is projected from a betting line --
+# the market reaches this app in two places, both about a team's afternoon, and both are spent in
+# `src.model.team` before the player chain starts. What is left for a reader is the useful part: two
+# independent estimates of the same game, and the places they disagree most are the places to look.
+#
+# The disagreement is read against `ui.MARKET_NOISE`. Both numbers miss a team's actual points by about
+# seven a game in week 1, and over 2019-2025 the line beats this model's own estimate by 0.7% there, so a
+# three-point gap says nothing about either. What it cannot do is tell you which one is wrong.
+with market_tab:
+    gaps = ui.market_gaps(view)
+    by_team = ui.market_by_team(view)
+    ui.section(
+        "Against the posted lines",
+        "Two independent reads on the same game: the number a book has posted, and what this model "
+        "makes of the matchup on its own. Neither is projected from the other — a line never touches a "
+        f"player's targets or yards — so where they disagree by more than {ui.MARKET_WORTH_A_LOOK:.0f} "
+        "points, one of the two is wrong and it is worth knowing which. Under that, it is noise: both "
+        f"numbers miss a team's actual score by about {ui.MARKET_NOISE:.0f} points a game in week 1, and "
+        "measured over 2019-2025 the line is only 0.7% closer than the model at that horizon.",
+        sub=f"{gaps.height} team-games have a number posted, of {games.height}",
+        level=2,
+    )
+    if gaps.is_empty():
+        st.info("No lines on file for this season yet. Nothing here is needed for a projection — the "
+                "model estimates every game from the two rosters either way.")
+    else:
+        big = gaps.filter(pl.col("gap").abs() >= ui.MARKET_WORTH_A_LOOK)
+        ui.tiles([
+            {"name": "average disagreement", "value": float(gaps["gap"].abs().mean()), "digits": 1,
+             "highlight": True, "sub": "points a game between the two estimates"},
+            {"name": "worth a look", "value": big.height, "digits": 0,
+             "sub": f"gaps of {ui.MARKET_WORTH_A_LOOK:.0f}+ points"},
+            {"name": "biggest gap", "value": float(gaps["gap"].abs().max()), "digits": 1,
+             "sub": f"{gaps.row(0, named=True)['team']} week {int(gaps.row(0, named=True)['week'])}"},
+            {"name": "model above the line", "value": float((gaps["gap"] > 0).mean()), "digits": 0,
+             "percent": True, "sub": "the rest are below it — 50% is unbiased"},
+            {"name": "weight the line carries", "value": ui.market_weight_used(view), "digits": 2,
+             "sub": "of a lined game's scoring level · 0 turns it off"},
+        ])
+
+        st.divider()
+        ui.section("Team by team",
+                   "Sorted by disagreement, the model above the line first. `carried offset` is the part "
+                   "of a team's gap the projection accepts and applies to its unlined games too — shrunk "
+                   "toward zero, because two lined games is not enough to move fifteen others whole.",
+                   sub="lined games only, except the last two columns")
+        ui.table(
+            by_team, digits=1,
+            order=["team", "lined", "market_per_game", "model_per_game", "gap", "worst_gap",
+                   "carried_offset", "used_per_game", "games"],
+            height=560,
+            config={"lined": st.column_config.NumberColumn("lined", format="%d", width="small"),
+                    "games": st.column_config.NumberColumn("games", format="%d", width="small"),
+                    "market_per_game": st.column_config.NumberColumn("line PF/g", format="%.1f"),
+                    "model_per_game": st.column_config.NumberColumn("model PF/g", format="%.1f"),
+                    "gap": st.column_config.NumberColumn("gap", format="%+.1f"),
+                    "worst_gap": st.column_config.NumberColumn("worst", format="%.1f"),
+                    "carried_offset": st.column_config.NumberColumn("carried offset", format="%+.1f"),
+                    "used_per_game": st.column_config.NumberColumn("used PF/g", format="%.1f")},
+        )
+        ui.note("`used PF/g` is what the projection actually runs on, over all seventeen games: the "
+                "blend where a line exists and the model's own estimate plus the carried offset where "
+                "one does not.")
+
+        st.divider()
+        ui.section("Game by game",
+                   "The same gaps unaggregated, biggest first. A single game this far apart is usually "
+                   "one of three things: a depth chart the model has wrong, a line that has news the "
+                   "model has not, or a team the model prices wrong all season — the middle column tells "
+                   "the three apart, since a team that is off by the same amount every week is the third.",
+                   sub="every lined game")
+        ui.table(
+            gaps, digits=1,
+            order=[c for c in ("week", "team", "opponent", "is_home", "market_points", "own_points",
+                               "gap", "implied_points", "market_spread", "model_spread")
+                   if c in gaps.columns],
+            height=560,
+            config={"week": st.column_config.NumberColumn("wk", format="%d", width="small"),
+                    "is_home": st.column_config.CheckboxColumn("home", width="small"),
+                    "market_points": st.column_config.NumberColumn("line", format="%.1f"),
+                    "own_points": st.column_config.NumberColumn("model", format="%.1f"),
+                    "gap": st.column_config.NumberColumn("gap", format="%+.1f"),
+                    "implied_points": st.column_config.NumberColumn("used", format="%.1f"),
+                    "market_spread": st.column_config.NumberColumn("line spread", format="%+.1f"),
+                    "model_spread": st.column_config.NumberColumn("model spread", format="%+.1f")},
+        )
+        ui.note("To take the lines out of the projection entirely, turn off **Use posted lines** in the "
+                "sidebar. It costs about a point of accuracy on projected margins and roughly five "
+                "percentage points of straight-up winners. It barely touches the player board: no "
+                "player rating is estimated from a line, and switching the market off moves the median "
+                "player by 0.02 projected points across a whole season, the most affected by 0.8.")
+
+# --------------------------------------------------------------------------- #
+# 5. how far through the league
 # --------------------------------------------------------------------------- #
 with coverage_tab:
     done = ui.coverage(view)

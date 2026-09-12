@@ -37,6 +37,43 @@ from src.model.blend import blend_counts, ratio, shrink, shrink_weight
 TABLE_POSITIONS = {"qb": ("QB",), "skill": ("RB", "WR", "TE")}
 
 
+def to_date(metric: priors.Metric, target: int, settings: Settings) -> pl.DataFrame | None:
+    """This season so far as one more season of the player's own history, or None if it cannot be.
+
+    Both halves of that sentence are load-bearing. A season projection made in November should know
+    what happened in September -- not only for the weeks already played, which `compose.actualise`
+    substitutes outright, but for the weeks still to come: a receiver running a 28% target share
+    through five games is telling us something about his remaining twelve that no amount of last
+    year's history knows. Returning it shaped like a history row is what lets `blend_counts` weigh it
+    without a special case, and weigh it *by how much of it there is*, so it grows from a rumour in
+    week 1 to the dominant evidence by December on its own.
+
+    None in four cases, and each is a refusal rather than a gap:
+
+    - not the season in progress. The backtest projects a finished season and scores it against that
+      season's own rows, so letting lag 0 in there would report a model that already knew the answer.
+      This is the same guard `blend.season_weights` keeps and it is checked twice on purpose.
+    - the user asked for the model on its own (`use_inseason_form` off), which is the only honest way
+      to read what the preseason estimate was worth.
+    - no games in the books yet.
+    - the live tables cannot measure *both* sides of this metric's ratio. That is the important one.
+      Nobody publishes routes run or red-zone targets within hours of a game, and half a ratio is
+      worse than none of it: a quarterback's sacks with no dropbacks to divide them by would add
+      sacks to the numerator, nothing to the denominator, and report his sack rate as doubled. A
+      metric the weekly tables cannot close keeps its preseason estimate, which is a real limit of
+      this and is written down in `src/data/inseason.py` rather than hidden here.
+    """
+    if target != PROJ_SEASON or not settings.use_inseason_form:
+        return None
+    from src.data import inseason           # local: only the projection season pays for the import
+
+    cur = inseason.to_date(metric.table, target)
+    if cur.is_empty() or not {metric.num, metric.den} <= set(cur.columns):
+        return None
+    cur = cur.filter(pl.col(metric.den).cast(pl.Float64).fill_null(0.0) > 0)
+    return None if cur.is_empty() else cur
+
+
 def own_rate(
     metric: priors.Metric, target: int, settings: Settings, hist: pl.DataFrame | None = None
 ) -> pl.DataFrame:
@@ -44,15 +81,28 @@ def own_rate(
 
     Counts are blended and then divided, so `n` is a real opportunity count and `obs` is the ratio
     that count actually produced. The leakage guard is `blend_counts`, which zeroes the weight on the
-    target season and every season after it.
+    target season and every season after it -- except for the season actually in progress, where the
+    games already played are evidence about the games left rather than the answer to them. `to_date`
+    decides that, and returning None from it is what makes this function's old behaviour the default.
     """
     hist = priors._hist(metric.table) if hist is None else hist
+    keep = ["player_id", "season", "games", metric.num, metric.den]
     past = hist.filter((pl.col("season") >= metric.since) & (pl.col("season") < target))
+    past = past.select([c for c in keep if c in past.columns])
+
+    cur = to_date(metric, target, settings)
+    current = 0.0
+    if cur is not None:
+        # weighted like last season, because that is what it is on its way to being. The count blend
+        # scales it down to the games actually in it, so this is a ceiling and not a thumb on the scale.
+        current = float(settings.recency[0]) if settings.recency else 1.0
+        past = pl.concat([past, cur.select([c for c in keep if c in cur.columns])],
+                         how="diagonal_relaxed")
     if past.is_empty():
         return pl.DataFrame(schema={"player_id": pl.String, "obs": pl.Float64, "n": pl.Float64,
                                     "seasons_used": pl.UInt32, "last_season": pl.Int32})
     b = blend_counts(past, target, [metric.num, metric.den], by=("player_id",),
-                     weights=settings.recency)
+                     weights=settings.recency, current=current)
     return b.select(
         "player_id", "seasons_used", "last_season",
         ratio(metric.num, metric.den, "obs"),
@@ -174,6 +224,10 @@ def season_history(
 
     Both are needed for the same decision, which is why they are separate functions rather than one
     frame -- an override is argued from the record and applied against the estimate.
+
+    The season in progress is a row here like any other, unfinished. It has to be: it is now part of
+    what the estimate reads, and a record that stopped last December would leave a user arguing with a
+    number he cannot see the reason for. `games` says how much of it there is.
     """
     frames = []
     for name in names:
@@ -183,6 +237,10 @@ def season_history(
         hist = priors._hist(metric.table)
         if metric.num not in hist.columns or metric.den not in hist.columns:
             continue
+        live = to_date(metric, PROJ_SEASON, Settings())
+        if live is not None:
+            hist = pl.concat([hist, live.with_columns(pl.lit(None, pl.String).alias("player"))],
+                             how="diagonal_relaxed")
         d = hist.filter(pl.col("season") >= metric.since)
         if seasons:
             d = d.filter(pl.col("season").is_in(list(seasons)))

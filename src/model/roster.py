@@ -95,10 +95,10 @@ from src.data import depth, history, lake
 from src.model import estimate, priors
 from src.model.blend import season_weights, shrink, shrink_weight
 
-# The three field-presence rates plus the quarterback's equivalent. `rush_participation` is an RB
-# statistic in practice -- the play-by-play credits a designed rush to the back, so receivers score a
-# flat zero and the metric simply does not fire for them.
-PARTICIPATION_METRICS = ("snap_share", "route_participation", "rush_participation", "dropback_share")
+# The field-presence rates plus the quarterback's equivalent. `rush_participation` was here and is gone:
+# the play-by-play credits a designed run to the man who carried it, so it was never field presence, and
+# what it measured was `carry_share` spelled differently (see `opportunity.POOLS`).
+PARTICIPATION_METRICS = ("snap_share", "route_participation", "dropback_share")
 
 # Games played collapses with depth in a way participation does not: a fifth receiver plays 10.5
 # games, an eighth half of one. Deep enough to reach the bottom of a real roster; the isotonic

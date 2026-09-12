@@ -8,6 +8,15 @@ The three that matter most are the ones the workbook could not state at all: a d
 exactly one of three ways, a quarterback's rushes split into designed runs and scrambles that add back
 to his total, and a season is the sum of the games on the real schedule rather than a per-game number
 multiplied by seventeen.
+
+Every identity here is a contract on the *projection*, so the `settings` fixture turns `use_actuals`
+off and the frame under test is what the model believes start to finish. That is not the frame the app
+shows in season, and the difference is deliberate rather than a gap: a week that has been played is
+replaced by what happened in it, and a receiver who caught six of nine has six receptions whatever his
+projected catch rate was. `count x rate` is the engine's arithmetic and a box score is not obliged to
+obey it. The substitution gets its own contracts at the foot of the file, on a frame built with the
+setting on -- what a completed week must satisfy is that it equals the record, which is a stronger
+claim than the identity it breaks.
 """
 
 from __future__ import annotations
@@ -24,7 +33,8 @@ from src.model import compose, efficiency, opportunity
 
 @pytest.fixture(scope="module")
 def settings() -> Settings:
-    return Settings()
+    """The model on its own. See the note in the module docstring on why `use_actuals` is off here."""
+    return Settings(use_actuals=False)
 
 
 @pytest.fixture(scope="module")
@@ -93,6 +103,28 @@ def test_touchdowns_come_from_the_team_pool_and_not_from_a_rate(wk, opp):
     for col in ("receiving_tds", "rushing_tds", "passing_tds"):
         d = (pl.col(col) - pl.col(f"{col}_pool").fill_null(0.0)).abs()
         assert float(j.select(d.max()).item()) < 1e-9, col
+
+
+def test_the_declared_stat_inputs_are_what_the_stat_line_reads() -> None:
+    """`STAT_RATES` and `STAT_POOLS` decide which knobs the app offers, so they cannot go stale.
+
+    `overrides` takes its dead-knob lists as the complement of these two tuples. If somebody teaches the
+    stat line to read `tprr` and this test does not fail, `tprr` stays quietly unofferable forever --
+    and if somebody stops reading `completion_pct`, it stays offered and does nothing. Read off the
+    arithmetic's own source rather than restated, because a second hand-written list would drift the
+    same way the first one did.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(compose._stat_line) + inspect.getsource(compose._dropback_fates)
+    read_rates = set(re.findall(r"used_([a-z0-9_]+)", src))
+    assert read_rates == set(compose.STAT_RATES)
+    assert set(compose.STAT_RATES) <= set(efficiency.RATE_METRICS)
+
+    pools = {p.name for p in opportunity.POOLS}
+    read_cols = set(re.findall(r"pl\.col\(\"([a-z0-9_]+)\"\)", src))
+    assert read_cols & pools == set(compose.STAT_POOLS)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,3 +443,118 @@ def test_a_board_without_a_previous_season_still_ranks(yr, settings):
     assert bare.height == yr.height
     assert "delta_points" not in bare.columns
     assert bare["vs_starter"].null_count() == 0
+
+
+# --------------------------------------------------------------------------- #
+# a week that has been played
+# --------------------------------------------------------------------------- #
+# The other contract, and the one the rest of this file deliberately switches off: in season a finished
+# week stops being a projection. What it has to satisfy is not `count x rate` -- a box score does not owe
+# the engine that -- but agreement with the record, which is stricter. If a substituted week does not
+# equal what the tables say happened then the season total is neither a projection nor a result.
+#
+# These tests are written to be vacuous before kickoff rather than skipped, because the guard that makes
+# them vacuous is itself the thing most worth checking: `actualise` is off for any season but the one in
+# progress, and if that ever breaks the backtest starts scoring a finished season against its own results
+# and reports a perfect model. So `test_a_finished_season_is_never_substituted` runs all year.
+@pytest.fixture(scope="module")
+def live(opp, player_rates) -> pl.DataFrame:
+    return compose.weekly(PROJ_SEASON, Settings(), opp, player_rates)
+
+
+def test_a_finished_season_is_never_substituted() -> None:
+    """The leakage guard, and the reason it is load-bearing rather than tidy.
+
+    The backtest projects a completed season and scores it against exactly the tables `actualise`
+    substitutes from, so a substitution there would hand the model the answer sheet and report it as
+    accuracy. Checked on the frame rather than by reading the flag: what matters is that no row of a
+    finished season is marked as a result, however the code arrived at that.
+    """
+    past = compose.weekly(LAST_COMPLETE_SEASON, Settings())
+    assert not past.is_empty()
+    if compose.PLAYED_COL in past.columns:
+        assert float(past[compose.PLAYED_COL].sum()) == 0.0
+
+
+def test_asking_for_the_model_alone_substitutes_nothing(wk) -> None:
+    """`use_actuals=False` has to be a true no-op, or there is no way to read the model's own accuracy."""
+    assert compose.PLAYED_COL in wk.columns
+    assert float(wk[compose.PLAYED_COL].sum()) == 0.0
+
+
+def test_a_played_week_is_marked_and_an_unplayed_one_is_not(live) -> None:
+    """Per team and week, not per league week: a Thursday result is a result while Sunday is not."""
+    from src.data import inseason
+
+    done = inseason.team_weeks(PROJ_SEASON)
+    marked = (live.filter(pl.col(compose.PLAYED_COL) > 0)
+              .select("team", "week").unique().sort(["team", "week"]))
+    assert marked.height == (0 if done.is_empty() else done.height)
+    if done.is_empty():
+        return
+    assert set(map(tuple, marked.rows())) == set(map(tuple, done.sort(["team", "week"]).rows()))
+    # and a marked man is there or he is not -- 0.94 of a game he played every snap of is a number
+    # about neither the projection nor the result
+    played = live.filter(pl.col(compose.PLAYED_COL) > 0)
+    assert set(played["p_play"].unique().to_list()) <= {0.0, 1.0}
+
+
+def test_a_substituted_week_ties_out_to_the_team_that_played_it(live) -> None:
+    """The board's totals for a finished game are the team's totals for it, from the team's own table.
+
+    Read off `team_stats` rather than summed from the players, so this cannot be satisfied by the board
+    agreeing with itself. A small shortfall is expected and is not modelling error: a result row for a
+    man the offensive board has no row for -- a fullback, a lineman who caught one -- has nowhere to go.
+    That is bounded here rather than hidden, and if it ever stops being small the crosswalk has broken.
+    """
+    from src.data import inseason
+
+    pools = inseason.team_pools(PROJ_SEASON)
+    if pools.is_empty():
+        return
+    got = (live.filter(pl.col(compose.PLAYED_COL) > 0)
+           .group_by(["team", "week"])
+           .agg(pl.col("targets").sum(), pl.col("carries").sum(), pl.col("attempts").sum()))
+    j = pools.join(got, on=["team", "week"], how="inner", suffix="_board")
+    assert j.height == got.height
+    for col in ("targets", "carries", "attempts"):
+        short = (pl.col(col) - pl.col(f"{col}_board")).abs()
+        assert float(j.select(short.max()).item()) <= 2.0, col
+
+
+def test_the_split_stats_still_add_back_to_the_total_that_was_measured(live) -> None:
+    """A measured total divided by a projected proportion has to come back to the total.
+
+    Nobody publishes designed runs and scrambles by Monday morning, so a quarterback's measured carries
+    are split by the proportion the model projected. The split is an estimate; the total is not, and the
+    parts are not allowed to drift from it.
+    """
+    qb = live.filter((pl.col(compose.PLAYED_COL) > 0) & (pl.col("position") == "QB"))
+    if qb.is_empty():
+        return
+    for total, parts in compose.SPLITS.items():
+        d = (pl.col(total) - pl.sum_horizontal([pl.col(p) for p in parts])).abs()
+        assert float(qb.select(d.max()).item()) < 1e-6, total
+
+
+def test_a_season_in_progress_is_results_plus_the_projected_rest(live, opp, player_rates) -> None:
+    """Which is the whole point, and the only test here that reads the season rather than the week."""
+    from src.data import inseason
+
+    pw = inseason.player_weeks(PROJ_SEASON)
+    if pw.is_empty():
+        return
+    yr_live = compose.seasonal(live, PROJ_SEASON, Settings())
+    yr_proj = compose.seasonal(
+        compose.weekly(PROJ_SEASON, Settings(use_actuals=False), opp, player_rates),
+        PROJ_SEASON, Settings(use_actuals=False),
+    )
+    assert yr_live.height == yr_proj.height
+    # somebody has to have moved, or the substitution is not reaching the season total at all
+    j = yr_proj.select("player_id", pl.col("fantasy_points").alias("proj")).join(
+        yr_live.select("player_id", pl.col("fantasy_points").alias("live")), on="player_id")
+    assert float((j["live"] - j["proj"]).abs().max()) > 1.0
+    # and a man's games are the ones he played plus the ones he is expected to
+    weeks_done = pw.group_by("team").agg(pl.col("week").n_unique()).select(pl.col("week").max()).item()
+    assert 0 < weeks_done <= 18
+    assert float(yr_live["games"].max()) <= 17.0 + 1e-9

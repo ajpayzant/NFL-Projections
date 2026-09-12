@@ -158,10 +158,10 @@ def test_the_slot_and_the_games_lead_every_column_set() -> None:
 def test_the_default_column_set_follows_the_positions_on_screen() -> None:
     wr = ui.sheet_fields(ui.SHEET_KNOBS, ["WR"])
     qb = ui.sheet_fields(ui.SHEET_KNOBS, ["QB"])
-    assert "target_share" in wr and "completion_pct" not in wr
-    assert "completion_pct" in qb and "catch_rate" not in qb
+    assert "target_share" in wr and "dropback_share" not in wr
+    assert "dropback_share" in qb and "catch_rate" not in qb
     both = ui.sheet_fields(ui.SHEET_KNOBS, ["QB", "WR"])
-    assert "completion_pct" in both and "target_share" in both
+    assert "dropback_share" in both and "target_share" in both
     # and the shortlist is a shortlist: naming no position is not the same as everything editable
     assert len(both) < len(ui.sheet_fields(ui.SHEET_EVERYTHING))
 
@@ -257,6 +257,61 @@ def test_a_games_two_rows_come_out_in_a_stable_order_even_with_nobody_at_home() 
     got = ui._sided(env)
     assert got.filter(pl.col("game_id") == "g1").sort("side")["team"].to_list() == ["LAC", "ARI"]
     assert sorted(got.filter(pl.col("game_id") == "g2")["side"].to_list()) == [0, 1]
+
+
+# --------------------------------------------------------------------------- #
+# the posted lines, as a check
+# --------------------------------------------------------------------------- #
+# The whole value of this surface is that the two numbers on it are independent. `model_points` on the
+# environment has already had the team's market offset added, so comparing *that* to the line it was
+# fitted against would show a model that agrees with the market because it was moved to.
+def test_the_market_check_compares_the_line_to_the_models_unblended_estimate() -> None:
+    v = ui.View(payload=Scenario(name="market").content_json())
+    gaps = ui.market_gaps(v)
+    if gaps.is_empty():                     # a season with no lines on file has nothing to check
+        pytest.skip("no posted lines for this season")
+    env = ui.environment(v).filter(pl.col("has_market"))
+    joined = gaps.join(env.select("week", "team", pl.col("model_points").alias("blended")),
+                       on=["week", "team"], how="inner")
+    assert joined.height == gaps.height
+    # the offset is taken back out, and the gap is that estimate against the line
+    assert ((joined["own_points"] + joined["market_offset"] - joined["blended"]).abs() < 1e-9).all()
+    assert ((joined["own_points"] - joined["market_points"] - joined["gap"]).abs() < 1e-9).all()
+    # and what the projection runs on lies between the two, because it is a blend of them
+    lo = pl.min_horizontal("market_points", "blended")
+    hi = pl.max_horizontal("market_points", "blended")
+    assert joined.filter((pl.col("implied_points") < lo - 1e-6)
+                         | (pl.col("implied_points") > hi + 1e-6)).is_empty()
+
+
+def test_the_team_rollup_counts_only_lined_games_and_carries_one_offset() -> None:
+    """A team's gap is estimated from its lined games alone; the offset it carries is one number."""
+    v = ui.View(payload=Scenario(name="market").content_json())
+    per, gaps = ui.market_by_team(v), ui.market_gaps(v)
+    if per.is_empty():
+        pytest.skip("no posted lines for this season")
+    assert int(per["lined"].sum()) == gaps.height
+    assert (per["lined"] <= per["games"]).all()
+    one = gaps.group_by("team").agg(pl.col("market_offset").n_unique().alias("n"))
+    assert one["n"].max() == 1
+
+
+def test_the_weight_the_page_reports_is_the_one_the_engine_will_use() -> None:
+    """`None` means "use what was fitted", and a reader checking a projection needs the number."""
+    from src.model import team as team_model
+
+    fitted = float(team_model.load_market()["market_weight"])
+    assert ui.fitted_market_weight() == fitted
+    assert ui.market_weight_used(ui.View(payload=Scenario(name="a").content_json())) == fitted
+    off = Scenario(name="b").patch_league(market_weight=0.0)
+    assert ui.market_weight_used(ui.View(payload=off.content_json())) == 0.0
+    # the sidebar dial: any weight between the two ends survives the round trip, and the fitted number
+    # itself is stored as unset so a refit still moves it
+    part = Scenario(name="c").patch_league(market_weight=0.25)
+    assert ui.market_weight_used(ui.View(payload=part.content_json())) == 0.25
+    same = Scenario(name="d").patch_league(market_weight=0.25).patch_league(market_weight=None)
+    assert "market_weight" not in same.league
+    assert ui.market_weight_used(ui.View(payload=same.content_json())) == fitted
 
 
 def test_the_view_is_the_scenarios_content_and_settings_follow_it() -> None:
@@ -693,11 +748,21 @@ def test_a_knob_knows_whether_it_is_zero_sum() -> None:
     assert ui.knob_kind("expected_games") == "availability"
     assert ui.knob_kind("target_share") == "pool"
     assert ui.knob_kind("dropback_share") == "pool"               # not presence: a QB2 is not a co-starter
-    assert ui.knob_kind("snap_share") == "presence"
     assert ui.knob_kind("yards_per_target") == "rate"
     assert ui.knob_kind("nothing_the_engine_has") == "rate"       # an unknown number is nobody else's
 
-    for kind in ("availability", "pool", "presence", "rate"):
+    # playing time beats the shape test, which is the whole point of the exception: both snap shares
+    # divide a pool that is not exclusive, so `pool_for_field` is None and the shared pool is the snap
+    # pool -- read off shape alone they would be `presence`, "nobody else moves", which is what the
+    # engine stopped doing when it started spending them on every other claim the man makes.
+    assert ui.knob_kind("snap_share") == "playing time"
+    assert ui.knob_kind("qb_snap_share") == "playing time"
+    assert ui.shared_pool_for_field("qb_snap_share") == "offense_snaps"
+    assert ui.pool_for_field("qb_snap_share") is None
+    # and a participation term that is still evidence keeps the old reading
+    assert ui.knob_kind("route_participation") == "presence"
+
+    for kind in ("availability", "playing time", "pool", "presence", "rate"):
         assert ui.KIND_NOTE[kind] and ui.KIND_ICON[kind]
 
 
@@ -739,8 +804,14 @@ def test_the_reading_names_the_transfer_and_does_not_claim_one_that_is_not_there
 
     assert "availability scales" in ui._reading("expected_games", "A", -75.6, 75.2, 30,
                                                normalising=True)
-    assert "takes nothing from anybody" in ui._reading("snap_share", "A", 4.0, 0.0, 0,
-                                                      normalising=True)
+    assert "takes nothing from anybody" in ui._reading("route_participation", "A", 4.0, 0.0, 0,
+                                                       normalising=True)
+    # playing time does take it from somebody, and the sentence has to say so rather than reassure
+    moved = ui._reading("snap_share", "A", 15.5, -11.0, 12, normalising=True)
+    assert "scales every claim he makes at once" in moved
+    assert "on the field instead of" in moved
+    assert "takes nothing from anybody" not in moved
+    assert "check the room" in ui._reading("qb_snap_share", "A", 21.3, 0.0, 0, normalising=True)
     alone = ui._reading("yards_per_target", "A", 10.0, 0.0, 0, normalising=True)
     assert "nobody else's line rides on it" in alone
     assert "his room" not in alone                       # no room panel, so no sentence about one

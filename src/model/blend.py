@@ -24,22 +24,55 @@ import polars as pl
 
 DEFAULT_WEIGHTS = (5.0, 3.0, 2.0)
 
+# Games in a team's season, which is what a season-to-date is a fraction of. Seventeen, not the
+# eighteen weeks the calendar runs to: a bye is not a game anybody played.
+REG_GAMES = 17
+
 
 def season_weights(
     season_col: str = "season",
     target: int | pl.Expr = 0,
     weights: Sequence[float] = DEFAULT_WEIGHTS,
+    current: float = 0.0,
 ) -> pl.Expr:
     """Recency weight for a row, by how many seasons back it is from `target`.
 
-    Seasons at or after the target get weight 0 -- that is the leakage guard, and it lives here so
-    every caller inherits it rather than remembering it.
+    Seasons after the target get weight 0, and so does the target season itself unless `current` says
+    otherwise -- that is the leakage guard, and it lives here so every caller inherits it rather than
+    remembering it. It defaults to zero because most callers must not relax it: the backtest projects a
+    finished season and scores it against that season's own rows, so any weight on lag 0 there would
+    report a model that knows the answer.
+
+    `current` is for the one case where lag 0 is not leakage -- the season actually in progress, where
+    the games already played are evidence about the games left and withholding them is the error. It is
+    a weight on the same scale as `weights`, so passing `weights[0]` says "what has happened this year
+    counts like last year did", which is the natural reading and is what the projection path passes.
+    Nothing about it is fitted: the blend is on counts, so two games of data carry two games of weight
+    whatever this number is, and it only sets how a *completed* season-to-date would compare.
     """
     lag = (pl.lit(target) if isinstance(target, int) else target) - pl.col(season_col)
-    expr = pl.when(lag < 1).then(0.0)
+    expr = pl.when(lag < 0).then(0.0).when(lag == 0).then(float(current))
     for i, w in enumerate(weights, start=1):
         expr = expr.when(lag == i).then(float(w))
     return expr.otherwise(0.0).alias("recency_weight")
+
+
+def _season_fraction(hist: pl.DataFrame, target_season: int, season_col: str) -> float:
+    """How much of a season the target-season rows cover, as a fraction of the 17 games in one.
+
+    From the rows' own `games`, at the busiest player rather than the average: the mean is dragged down
+    by everybody who has been hurt or inactive, and the question is how far into the season we are, not
+    how much football this particular room has played. Falls back to a whole season when `games` is
+    missing, which understates `n` and so trusts the prior a little more -- the safe direction to be
+    wrong in, and the only one that cannot invent confidence out of two games.
+    """
+    rows = hist.filter(pl.col(season_col) == target_season)
+    if rows.is_empty() or "games" not in rows.columns:
+        return 1.0
+    played = rows["games"].cast(pl.Float64).max()
+    if played is None or played <= 0:
+        return 0.0
+    return min(float(played) / REG_GAMES, 1.0)
 
 
 def blend_counts(
@@ -50,6 +83,7 @@ def blend_counts(
     weights: Sequence[float] = DEFAULT_WEIGHTS,
     season_col: str = "season",
     scale: bool = True,
+    current: float = 0.0,
 ) -> pl.DataFrame:
     """Recency-weighted totals of `count_cols` from seasons strictly before `target_season`.
 
@@ -60,9 +94,17 @@ def blend_counts(
     one-season scale without erasing how much history is behind them: three seasons of 600 team
     targets blends to 600, one season to 300. Ratios are unaffected -- it only fixes the units of
     `n`, and those units are what a fitted `k` is quoted in.
+
+    `current` lets the target season itself in, for the season in progress -- see `season_weights`. It
+    changes the divisor as well as the sum, and has to: a season two games old is two games of evidence,
+    not a season's worth, so it enters the divisor as the *fraction* of a season it covers. Get that
+    wrong and `n` stops meaning opportunities-per-season, which is the unit every fitted `k` is quoted
+    in -- at week 2, counting it whole would divide by a third more weight than was added and quietly
+    shrink every player on the board toward his position prior. The fraction is measured from the rows
+    themselves rather than from the calendar, so a team on a bye is not credited with a game.
     """
     cols = [c for c in count_cols if c in df.columns]
-    w = season_weights(season_col, target_season, weights)
+    w = season_weights(season_col, target_season, weights, current)
     hist = df.with_columns(w).filter(pl.col("recency_weight") > 0)
     if hist.is_empty():
         schema = {c: pl.Float64 for c in cols}
@@ -76,6 +118,8 @@ def blend_counts(
             }
         )
     denom = float(sum(weights)) if scale else 1.0
+    if scale and current > 0:
+        denom += float(current) * _season_fraction(hist, target_season, season_col)
     aggs = [
         ((pl.col(c).cast(pl.Float64).fill_null(0.0) * pl.col("recency_weight")).sum() / denom).alias(c)
         for c in cols

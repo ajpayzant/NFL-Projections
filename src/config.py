@@ -106,6 +106,24 @@ class Settings:
     normalize_pools: bool = True     # rescale exclusive team pools to sum to 1
     games_projected: int = 17        # per team; per player it is availability-adjusted
 
+    # In season, a week that has been played is replaced by what happened in it, so a season total is
+    # results-to-date plus the projected rest rather than a forecast of a game whose score is known.
+    # On by default because that is what a projection made in November means; off is the honest way to
+    # ask what the model would say on its own, which is the only way to read its own accuracy.
+    # `compose.actualise` ignores it for any season but the one in progress -- the backtest scores a
+    # finished season against these same tables, and substituting them there would report a perfect model.
+    use_actuals: bool = True
+
+    # And the games not yet played learn from the ones that were. `use_actuals` replaces a finished week
+    # with its result; this is the other half, and the half that changes the *rest* of the season: a
+    # receiver running a 28% target share through five games is evidence about his remaining twelve.
+    # `estimate.to_date` shapes the season so far as one more season of the player's own history, so it
+    # is blended and shrunk by exactly the machinery three years of history go through, and weighted by
+    # how much of it there is -- a rumour in week 1, the dominant evidence by December, with no schedule
+    # anybody chose. Off is the model on its own, which is the only way to read what August was worth.
+    # Ignored for any season but the one in progress, for the same reason as `use_actuals`.
+    use_inseason_form: bool = True
+
     # Who pays when a room claims more of a pool than the pool holds. The residual is taken in
     # proportion to `claim ** pool_tilt`, so the exponent is the whole behaviour:
     #

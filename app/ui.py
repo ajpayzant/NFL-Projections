@@ -269,11 +269,49 @@ def controls(title: str, icon: str = "🏈") -> View:
             help="Blend the Vegas line into a game's scoring level where one is posted. Off uses the "
                  "model's own team estimate everywhere.",
         )
+        # The weight is a dial and not a switch on purpose: the line should be one of two opinions about
+        # a game rather than the whole answer, and how much of it to take is a judgement a reader is
+        # entitled to make. Left at the fitted number it is stored as unset, so a refit moves it.
+        weight = None
+        if market:
+            fitted = fitted_market_weight()
+            was_set = sc.league.get("market_weight")
+            weight = st.slider(
+                "How much of the line", 0.0, 1.0,
+                value=float(was_set) if was_set not in (None, 0.0) else fitted, step=0.05,
+                help=f"0.00 is the model on its own, 1.00 is the posted line taken at face value. "
+                     f"The fitted number is {fitted:.2f}, from week-1 games back to 2019 — the only "
+                     f"week where the market knows no more about the season than we do.",
+            )
+            if abs(weight - fitted) < 1e-9:
+                weight = None
+        # The two in-season switches, offered only once there is a season to be in: before kickoff they
+        # are a pair of controls that change nothing, and a control that does nothing teaches a reader
+        # that the controls do nothing. Off is not a lesser setting -- it is the model on its own, which
+        # is the only way to read what the preseason projection was actually worth.
+        actuals = bool(sc.league.get("use_actuals", True))
+        form = bool(sc.league.get("use_inseason_form", True))
+        if inseason_weeks()["played"] > 0:
+            actuals = st.toggle(
+                "Count games played", value=actuals,
+                help="A week that has been played stops being a projection and becomes what happened "
+                     "in it, so a season total is results-to-date plus the projected rest. Off asks "
+                     "what the model would say on its own, which is how you read its own accuracy.",
+            )
+            form = st.toggle(
+                "Learn from this season", value=form,
+                help="The games already played also inform the games still to come: this season enters "
+                     "a player's own history like any other season, weighted by how much of it there "
+                     "is — barely anything in week 1, the dominant evidence by December. Only for the "
+                     "numbers the weekly tables can measure; routes and red-zone work still wait on "
+                     "the weekly rebuild.",
+            )
         # written back only when something moved: patching on every rerun would restamp `updated`
         # and, worse, make the widgets fight a scenario the Edits page had just loaded.
         edited = sc.patch_league(scoring=scoring, normalize_pools=normalize,
                                  use_context_factors=context,
-                                 market_weight=None if market else 0.0)
+                                 use_actuals=actuals, use_inseason_form=form,
+                                 market_weight=weight if market else 0.0)
         if edited.league != was or edited.scoring != sc.scoring:
             sc = edited
             set_live(sc)
@@ -426,6 +464,65 @@ def scoring_label(name: str) -> str:
             "ppr_6td": "PPR, 6-pt passing TD"}.get(name, name)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def inseason_weeks() -> dict:
+    """How far the results reach. Deliberately cheap -- three small parquet files and no projection.
+
+    Read on every rerun, to decide whether the in-season switches are offered at all, and read before
+    the sidebar has written its scenario back -- so it must not touch the board. The orphan count, which
+    does, is a separate function drawn at the foot of the sidebar where a board already exists. Short TTL
+    rather than none: long enough that a page of edits does not re-read the files, short enough that a
+    mid-session refresh shows up.
+    """
+    from src.data import inseason
+
+    out = {"complete": 0, "played": 0, "rows": 0}
+    try:
+        out["complete"] = inseason.weeks_complete(PROJ_SEASON)
+        out["played"] = inseason.weeks_played(PROJ_SEASON)
+        out["rows"] = int(inseason.player_weeks(PROJ_SEASON).height)
+    except Exception:                     # noqa: BLE001 -- no season yet is the normal preseason case
+        pass
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def inseason_orphans(_key: str) -> int:
+    """Men with a result the offensive board has no row for.
+
+    A fullback, a lineman who caught one, a rookie the crosswalk has not reached. Their production has
+    nowhere to go, so a substituted team week is short by exactly their share of it. Surfaced rather than
+    hidden because it is the one bounded, known error in a substituted week: at one or two men it is the
+    price of projecting four positions, and if it climbs then the crosswalk has broken and every share
+    on those teams is being measured against a pool the board cannot fill.
+    """
+    from src.data import inseason
+
+    try:
+        pw = inseason.player_weeks(PROJ_SEASON)
+        if pw.is_empty():
+            return 0
+        did = pw.filter(pl.sum_horizontal(
+            [pl.col(c) for c in ("targets", "carries", "attempts") if c in pw.columns]) > 0)
+        known = board(view()).select("player_id")
+        return int(did.join(known, on="player_id", how="anti")["player_id"].n_unique())
+    except Exception:                     # noqa: BLE001
+        return 0
+
+
+def _inseason_panel() -> None:
+    weeks = inseason_weeks()
+    if not weeks["played"]:
+        return
+    through = (f"complete through week {weeks['complete']}" if weeks["complete"]
+               else f"week {weeks['played']} in progress")
+    st.caption(f"🗓️ {through} · {weeks['rows']:,} player-game results")
+    orphans = inseason_orphans(str(weeks["rows"]))
+    if orphans:
+        st.caption(f"{orphans} men with a result are not on the offensive board — a substituted team "
+                   f"week is short by their share of it")
+
+
 def _freshness_panel() -> None:
     status = freshness()
     stale = status.filter(pl.col("missing_proj_season"))
@@ -434,6 +531,7 @@ def _freshness_panel() -> None:
     st.caption(f"oldest table {oldest:.0f} days old" if oldest is not None else "no tables found")
     if not stale.is_empty():
         st.warning(f"missing {PROJ_SEASON}: {', '.join(stale['table'].to_list())}", icon="⚠️")
+    _inseason_panel()
     _update_panel()
 
 
@@ -690,6 +788,99 @@ def standings_accuracy() -> dict[str, float]:
     from src.model import standings as model
 
     return model.accuracy()
+
+
+# --------------------------------------------------------------------------- #
+# the posted lines, as a check rather than as a source
+# --------------------------------------------------------------------------- #
+# No player stat in this app is projected from a betting line. Lines enter in exactly two places, both
+# in `src.model.team` and both about the team's afternoon rather than anybody's stat line: a fitted
+# weight blends the posted number into the team's scoring level, and a fitted slope per metric tilts a
+# team's per-game volumes toward its own shootouts. Both are spent before the player chain begins, which
+# is why `implied_points` is a knob for the standings and moves nobody's targets.
+#
+# That weight was fitted on **week 1** on purpose, because a week-12 line knows weeks 1 to 11 and a
+# preseason projection does not. Measured over 2019-2025 the whole grid from "ignore the line" to "use
+# only the line" is 7.149 to 7.125 points per team-game, best at 7.096 in the middle -- so the market's
+# genuine preseason edge over this model is about 0.7%, and the honest reading is that the two are the
+# same number. Where the line does earn its place is direction: on week-1 margins the blend picks the
+# winner 66.1% of the time against 60.7% for the model alone, which is worth having in a win-total
+# table. On player season points it is worth nothing at all -- the backtest's `closing_lines` variant,
+# which uses the market at the fitted weight *and* gets closing rather than preseason numbers, is very
+# slightly worse than market-off in all five scored seasons (37.49 MAE against 37.45).
+#
+# Hence this surface. The blend stays because it is measured to help the one thing it feeds, and the
+# lines are also shown raw, next to the model's own unblended estimate, so a projection can be checked
+# against them. It is a check and not a source, and it is read with the number below in mind.
+MARKET_NOISE = 7.1        # points per team-game: what the line and this model each miss by at week 1
+MARKET_WORTH_A_LOOK = 4.0  # a gap under this is inside the noise of both numbers
+
+
+def fitted_market_weight() -> float:
+    """What the week-1 fit settled on, which is what an unset `market_weight` resolves to."""
+    from src.model import team as team_model
+
+    return float(team_model.load_market()["market_weight"])
+
+
+def market_weight_used(v: View) -> float:
+    """The blend weight this scenario is running on, resolving `None` to the fitted number.
+
+    A league patch may set it to anything including zero; unset means "use what was fitted", and a
+    reader checking a projection against the lines needs the number that was actually used rather than
+    the word `None`.
+    """
+    got = v.settings.market_weight          # already carries the scenario's league patch
+    return float(got) if got is not None else fitted_market_weight()
+
+
+@st.cache_data(show_spinner="reading the posted lines", max_entries=SCENARIO_ENTRIES)
+def market_gaps(v: View) -> pl.DataFrame:
+    """Every game with a posted line: what the market says, what the model says on its own, the gap.
+
+    `model_points` on the environment has already had the team's market offset added to it, which is
+    what the projection uses; the offset is carried beside it so the model's own untouched estimate can
+    be recovered. Comparing the blended number to the line it was blended with would flatter both.
+    """
+    env = environment(v)
+    if "market_points" not in env.columns:
+        return pl.DataFrame(schema={"week": pl.Int32, "team": pl.String})
+    offset = pl.col("market_offset").fill_null(0.0) if "market_offset" in env.columns else pl.lit(0.0)
+    out = env.filter(pl.col("has_market")).with_columns(
+        (pl.col("model_points") - offset).alias("own_points"),
+    ).with_columns(
+        (pl.col("own_points") - pl.col("market_points")).alias("gap"),
+    )
+    keep = [c for c in ("week", "team", "opponent", "is_home", "market_points", "own_points", "gap",
+                        "market_offset", "implied_points", "market_spread", "model_spread",
+                        "total") if c in out.columns]
+    return out.select(keep).sort(pl.col("gap").abs(), descending=True)
+
+
+@st.cache_data(show_spinner="reading the posted lines", max_entries=SCENARIO_ENTRIES)
+def market_by_team(v: View) -> pl.DataFrame:
+    """One row per team: how its lined games price against the model, and what the app ended up using.
+
+    `lined` is the column to read first. Roughly a third of the season has a number posted this early,
+    so a team with two lined games has a gap estimated from two games -- which is exactly why the
+    offset carried into its other fifteen is shrunk toward zero rather than applied whole.
+    """
+    gaps = market_gaps(v)
+    if gaps.is_empty():
+        return gaps
+    used = environment(v).group_by("team").agg(
+        pl.col("implied_points").mean().alias("used_per_game"),
+        pl.len().alias("games"),
+    )
+    per = gaps.group_by("team").agg(
+        pl.len().alias("lined"),
+        pl.col("market_points").mean().alias("market_per_game"),
+        pl.col("own_points").mean().alias("model_per_game"),
+        pl.col("gap").mean().alias("gap"),
+        pl.col("gap").abs().max().alias("worst_gap"),
+        pl.col("market_offset").first().alias("carried_offset"),
+    )
+    return per.join(used, on="team", how="left").sort("gap", descending=True)
 
 
 # What a team is projected to *do*, summed off the same board the player pages read, so a total on this
@@ -1475,7 +1666,7 @@ STAT_GROUPS: dict[str, tuple[str, ...]] = {
                 "designed_rush_yards", "scramble_yards"),
     "Receiving": ("targets", "receptions", "receiving_yards", "receiving_tds",
                   "receiving_air_yards"),
-    "Playing time": ("games", "offense_snaps", "routes", "rush_plays", "fumbles_lost"),
+    "Playing time": ("games", "offense_snaps", "routes", "fumbles_lost"),
 }
 
 # The line for each position: what a box score would print for him, in box-score order.
@@ -1502,7 +1693,7 @@ STAT_BLOCKS: dict[str, tuple[str, ...]] = {
 # a different claim, so anything countable in single digits keeps a decimal.
 WHOLE_STATS = ("passing_yards", "rushing_yards", "receiving_yards", "passing_air_yards",
                "receiving_air_yards", "designed_rush_yards", "scramble_yards", "offense_snaps",
-               "routes", "rush_plays", "dropbacks", "attempts", "completions")
+               "routes", "dropbacks", "attempts", "completions")
 
 ALL_STATS = tuple(dict.fromkeys(c for group in STAT_GROUPS.values() for c in group))
 
@@ -1622,7 +1813,7 @@ SHARE_LABEL = {"share_dropbacks": "dropbacks", "share_carries": "carries",
 DEPTH_IDENTITY = ("player_id", "player", "team", "position", "depth_tier", "depth_slot",
                   "slot_bucket", "status", "is_rookie", "draft_pick", "years_exp", "age", "charted",
                   "team_disagreement", "alignment", "expected_games", "presence", "status_factor",
-                  "snap_share", "route_participation", "rush_participation", "dropback_share")
+                  "snap_share", "route_participation", "dropback_share")
 
 
 def depth_frame(v: View, team: str | None = None) -> pl.DataFrame:
@@ -2224,6 +2415,43 @@ def season_config(seasons: tuple[int, ...] = HISTORY_VIEW, digits: int = 3) -> d
     """Column config for a season block: the years as numbers, the trend as a line."""
     return {**fixed(digits, *[str(s) for s in seasons]),
             "record": st.column_config.LineChartColumn("trend")}
+
+
+# The numbers a room is argued about, in the order a reader reaches for them: the ratings the pools and
+# the stat line actually spend, and beside them the measurements that justify moving one. Which of these
+# a user can *type* is deliberately not declared here -- `overrides.PLAYER_FIELDS` decides that and the
+# grid is handed the intersection -- so a rating that stops being spent stops being typeable without
+# anybody editing this list. It lives here rather than on the page so `tests/test_ratings_audit.py` can
+# hold it to two things: every name is a real metric, and the ones a user can type are the ones the
+# projection spends.
+#
+# `qb_snap_share` leads the quarterback list because it is his playing time and the measured top knob for
+# the position -- 21.3 points a season at +10%, ahead of `expected_games`. The skill rooms get their
+# playing time from `snap_share`, which the participation frame already puts on the sheet, so repeating
+# it here would put the same column on twice.
+#
+# Every knob is on one of these lists and `tests/test_ratings_audit.py` holds it there. The quarterback's
+# two rushing rates are the reason that check exists: his rushing yards are `designed_rush_ypc` on his
+# designed runs plus `scramble_ypc` on his scrambles, and the sheet used to offer only
+# `yards_per_clean_rush` -- the single blended number those two replaced, which the stat line stopped
+# reading and nothing told anybody. It is kept, immediately after them, because it is still the readable
+# summary of both and a reasonable thing to compare them against; it is simply not typeable.
+ROOM_INPUTS = {
+    "QB": ("qb_snap_share", "dropback_share", "pass_td_share", "designed_rush_share", "qb_rush_td_share",
+           "attempt_rate", "completion_pct", "yards_per_attempt", "air_yards_per_attempt",
+           "pass_td_rate", "int_rate", "sack_rate", "scramble_rate",
+           "designed_rush_ypc", "scramble_ypc", "yards_per_clean_rush", "qb_fumble_rate"),
+    "RB": ("carry_share", "clean_rush_share", "rz_carry_share", "inside_5_carry_share",
+           "short_yardage_carry_share", "target_share", "rush_td_share", "rec_td_share",
+           "yards_per_carry", "rush_success_rate", "catch_rate", "yards_per_target", "fumble_rate"),
+    "WR": ("target_share", "air_yards_share", "rz_target_share", "late_down_target_share",
+           "rec_td_share", "catch_rate", "yards_per_target", "adot", "tprr", "fumble_rate"),
+    "TE": ("target_share", "air_yards_share", "rz_target_share", "rec_td_share", "catch_rate",
+           "yards_per_target", "adot", "tprr", "fumble_rate"),
+}
+
+# The one number a room is really argued about, and therefore the evidence the sheet opens with.
+ROOM_HEADLINE = {"QB": "dropback_share", "RB": "carry_share", "WR": "target_share", "TE": "target_share"}
 
 
 def room_evidence(v: View, metric: str, player_ids: tuple[str, ...] = ()) -> pl.DataFrame:
@@ -3015,10 +3243,15 @@ def bench_fields(v: View, player_id: str, column_set: str = "what moves it", *,
 def bench_field_set(column_set: str, position: str | None, *, per_week: bool = False) -> list[str]:
     """`bench_fields` without the lookup, so which knobs a scope offers is testable on its own."""
     if column_set == "availability":
-        chosen: tuple[str, ...] = (GAMES_METRIC, overrides.DEPTH_FIELD, "p_play", "snap_share",
-                                   "route_participation", "rush_participation")
+        # how much of the season, and how much of the game: `expected_games` is the weeks and the two snap
+        # shares are the share of each week, which is the pair a reader adjusts together. `route_participation`
+        # is deliberately not here -- it is still evidence, a claim on a pool nothing divides by, so editing
+        # it moved the count and no projection with it. Playing time is the exception and is now spent.
+        chosen: tuple[str, ...] = (GAMES_METRIC, overrides.DEPTH_FIELD, "p_play",
+                                   *overrides.PLAYING_TIME_METRICS, "dropback_share")
     elif column_set == "shares":
-        chosen = tuple(f for f in overrides.PLAYER_FIELDS if knob_kind(f) in ("pool", "presence"))
+        chosen = tuple(f for f in overrides.PLAYER_FIELDS
+                       if knob_kind(f) in ("pool", "presence", "playing time"))
     elif column_set == "rates":
         chosen = tuple(f for f in overrides.PLAYER_FIELDS if knob_kind(f) == "rate")
     elif column_set == "everything":
@@ -4488,7 +4721,6 @@ CONTRIBUTION_POOLS = (
     ("passing_tds", "Passing touchdowns"),
     ("offense_snaps", "Snaps"),
     ("routes", "Routes run"),
-    ("rush_plays", "Runs he is on the field for"),
     ("designed_qb_rushes", "Designed quarterback runs"),
 )
 POOL_NAME = dict(CONTRIBUTION_POOLS)
@@ -4516,17 +4748,29 @@ def shared_pool_for_field(field: str) -> str | None:
 
 KIND_NOTE = {
     "availability": "how many of the seventeen he is there for — every count he has scales with it",
+    "playing time": "how much of the game he is on the field for — every claim he makes is made in "
+                    "those snaps, so his room gives up the work he takes on",
     "pool": "his slice of a pool that sums to one — zero-sum, so his room pays for what he gains",
     "presence": "how much of the offence he is on the field for — not divided, so nobody else moves",
     "rate": "what he does with what he gets — his own number, and nobody else's line rides on it",
 }
-KIND_ICON = {"availability": "📅", "pool": "⚖️", "presence": "🕒", "rate": "🎯"}
+KIND_ICON = {"availability": "📅", "playing time": "🕒", "pool": "⚖️", "presence": "👥", "rate": "🎯"}
 
 
 def knob_kind(field: str) -> str:
-    """Which of the four kinds of number this is, which is what decides who else moves when it does."""
+    """Which kind of number this is, which is what decides who else moves when it does.
+
+    Playing time is tested before the pools and before `presence`, and it has to be: a snap share is a
+    share of a pool that is not exclusive -- five men are on the field for one snap -- so by shape alone it
+    reads as `presence`, "nobody else moves", which is exactly what it stopped being. The engine spends it
+    as a multiplier on every other claim the man makes, and the exclusive pools then settle, so a room
+    does pay for it. `overrides.PLAYING_TIME_METRICS` is the one place that is declared rather than
+    derived, and this is the display side of the same exception.
+    """
     if field in overrides.AVAILABILITY_FIELDS:
         return "availability"
+    if field in overrides.PLAYING_TIME_METRICS:
+        return "playing time"
     if pool_for_field(field):
         return "pool"
     if shared_pool_for_field(field):
@@ -4539,11 +4783,18 @@ def knob_kind(field: str) -> str:
 KNOB_HELP = {
     "expected_games": "How many of the seventeen he plays. The fastest way to run a holdout or an "
                       "injury, and the biggest single lever on a season total.",
-    "snap_share": "The share of the offence's snaps he is on the field for. Snaps are shared, so "
-                  "raising it takes nothing from anybody.",
+    "snap_share": "The share of the offence's snaps he is on the field for — his playing time, and the "
+                  "one knob that moves everything at once. Raising it scales every claim he makes in the "
+                  "same proportion: targets, carries, routes and touchdowns together, because he is out "
+                  "there for more of them. The pools still settle, so the work comes off the teammates he "
+                  "is now on the field instead of. It assumes his rate per snap holds.",
+    "qb_snap_share": "The share of the offence's snaps he is under centre for — the quarterback's playing "
+                     "time, and the biggest ordinary knob on his season. Use it for a man splitting a "
+                     "starting job; use **games** for one who misses weeks outright, and **depth slot** "
+                     "to hand him the job.",
     "route_participation": "The share of the team's dropbacks he runs a route on. His targets are this "
-                           "times his share of what gets thrown.",
-    "rush_participation": "The share of the team's designed runs he is on the field for.",
+                           "times his share of what gets thrown. Read-only: it follows his snap share, "
+                           "which is the knob that moves it.",
     "dropback_share": "The share of the team's dropbacks he takes. One quarterback takes a dropback, so "
                       "the room is filled in depth order: the starter gets his claim and the man behind "
                       "him gets what is left.",
@@ -4584,22 +4835,43 @@ KNOB_HELP = {
     "qb_fumble_rate": "How often he fumbles.",
 }
 
-# The knobs worth reaching for first, per position and in the order they move a projection. Every name
-# in `overrides.PLAYER_FIELDS` is editable somewhere; a room table showing twelve of them at once makes
-# the two that matter exactly as hard to find as the ten that do not, which is the complaint this
-# shortlist answers. Volume before efficiency in every list, because volume is what moves a season.
+# The knobs worth reaching for first, per position, in the order they move a projection. A room table
+# showing twelve numbers at once makes the two that matter exactly as hard to find as the ten that do
+# not, which is the complaint this shortlist answers -- and until it was measured the shortlist was part
+# of the problem: the quarterback list led with `pass_td_rate` and `completion_pct`, which move nothing
+# and nothing scored, and put `pass_td_share`, worth 7.5 points, last of twelve.
+#
+# So this order is measured, not argued: `scripts/knob_leverage.py` nudges each field by +10% on the best
+# man at that position on all 32 teams, re-runs the whole engine, and takes the median move in his own
+# projected points. The numbers behind the order below, in points of a season:
+#
+#     QB   qb_snap_share 21.3 · expected_games 18.9 · yards_per_attempt 13.7 · dropback_share 11.6
+#     RB   snap_share 13.4 · expected_games 13.4 · carry_share 12.1 · target_share 9.4
+#     WR   target_share 23.0 · snap_share 15.5 · expected_games 12.0 · yards_per_target 9.0
+#     TE   target_share 13.8 · snap_share 11.2 · expected_games 8.4 · yards_per_target 5.6
+#
+# Playing time is second or better at every position and first at quarterback, which is what it should be:
+# it is the only knob that moves a man's whole claim at once rather than one pool of it, so it beats the
+# single-pool shares everywhere except a number-one receiver, where a target share can be moved further
+# than a snap share can (a WR1 is already on the field for nearly every snap, so there is little room left
+# in his playing time and plenty in his slice of the throws).
+#
+# Two knobs beat all of these and are not in the lists because they have their own controls: releasing a
+# man is his whole season (131-248 points depending on position) and promoting a backup to slot 1 is 6.8
+# to 127. Anything under a tenth of a point is left out entirely -- it is reachable from the sheet's
+# named groups, but it does not belong on a first screen. Measured under full PPR, so a scoring preset
+# that pays for completions or six-point passing touchdowns would reorder the quarterback list.
 KNOBS = {
-    "QB": ("dropback_share", "expected_games", "attempt_rate", "yards_per_attempt", "pass_td_rate",
-           "completion_pct", "designed_rush_share", "yards_per_clean_rush", "int_rate", "sack_rate",
-           "scramble_rate", "pass_td_share"),
-    "RB": ("carry_share", "expected_games", "target_share", "yards_per_carry", "rush_td_share",
-           "rz_carry_share", "inside_5_carry_share", "snap_share", "catch_rate", "yards_per_target",
-           "rec_td_share", "short_yardage_carry_share"),
-    "WR": ("target_share", "expected_games", "yards_per_target", "rec_td_share", "catch_rate",
-           "air_yards_share", "route_participation", "rz_target_share", "adot", "tprr",
-           "late_down_target_share", "snap_share"),
-    "TE": ("target_share", "expected_games", "yards_per_target", "rec_td_share", "catch_rate",
-           "route_participation", "air_yards_share", "rz_target_share", "adot", "tprr", "snap_share"),
+    "QB": ("qb_snap_share", "expected_games", "yards_per_attempt", "dropback_share", "pass_td_share",
+           "clean_rush_share", "scramble_ypc", "int_rate", "qb_rush_td_share", "sack_rate",
+           "attempt_rate", "designed_rush_ypc", "designed_rush_share", "scramble_rate",
+           "qb_fumble_rate"),
+    "RB": ("snap_share", "expected_games", "carry_share", "target_share", "yards_per_carry",
+           "rush_td_share", "catch_rate", "yards_per_target", "rec_td_share", "fumble_rate"),
+    "WR": ("target_share", "snap_share", "expected_games", "yards_per_target", "catch_rate",
+           "rec_td_share", "carry_share", "yards_per_carry"),
+    "TE": ("target_share", "snap_share", "expected_games", "yards_per_target", "catch_rate",
+           "rec_td_share"),
 }
 
 
@@ -4631,18 +4903,19 @@ def knob_option(field: str) -> str:
 SHEET_ALWAYS = (overrides.DEPTH_FIELD, GAMES_METRIC)
 
 SHEET_GROUPS: dict[str, tuple[str, ...]] = {
-    "Depth & availability": ("snap_share", "route_participation", "rush_participation",
-                             "dropback_share", "designed_rush_share"),
-    "Volume shares": ("target_share", "carry_share", "air_yards_share", "route_participation",
-                      "late_down_target_share", "clean_rush_share", "dropback_share"),
-    "Scoring shares": ("rz_target_share", "rz_carry_share", "inside_5_carry_share",
-                       "short_yardage_carry_share", "rec_td_share", "rush_td_share",
-                       "pass_td_share", "qb_rush_td_share"),
-    "Catching & running rates": ("catch_rate", "yards_per_target", "adot", "tprr",
-                                 "yards_per_carry", "rush_success_rate", "fumble_rate"),
+    # the snap shares are here rather than with the volume shares because that is the question they
+    # answer: not what slice of the throws he takes, but how much of the game he is out there for at all.
+    # `SHEET_ALWAYS` has already put the slot and the games in front of them, which is the same question
+    # asked of the season rather than of a week.
+    "Depth & availability": (*overrides.PLAYING_TIME_METRICS, "dropback_share",
+                             "designed_rush_share"),
+    "Volume shares": ("target_share", "carry_share", "air_yards_share", "clean_rush_share",
+                      "dropback_share"),
+    "Scoring shares": ("rec_td_share", "rush_td_share", "pass_td_share", "qb_rush_td_share"),
+    "Catching & running rates": ("catch_rate", "yards_per_target", "yards_per_carry", "fumble_rate"),
     "Passing rates": ("attempt_rate", "completion_pct", "yards_per_attempt", "air_yards_per_attempt",
-                      "pass_td_rate", "int_rate", "sack_rate", "scramble_rate",
-                      "yards_per_clean_rush", "designed_rush_ypc", "scramble_ypc", "qb_fumble_rate"),
+                      "int_rate", "sack_rate", "scramble_rate", "designed_rush_ypc", "scramble_ypc",
+                      "qb_fumble_rate"),
 }
 SHEET_KNOBS = "What moves it"                 # position-aware, so not a fixed set of columns
 SHEET_EVERYTHING = "Everything editable"
@@ -5005,6 +5278,12 @@ def _reading(field: str, who: str, his: float, room: float, teammates: int,
     elif kind == "availability":
         tail = (" — availability scales every count he has, and normalisation hands what he is not "
                 "there for to the men behind him.")
+    elif kind == "playing time":
+        tail = (" — playing time scales every claim he makes at once, so the pools he shares hand the "
+                "work to the men he is on the field instead of."
+                if teammates else
+                " — playing time scales every claim he makes at once. Nobody else moved, which means the "
+                "pools he claims from were not being contended: check the room before trusting it.")
     elif kind == "presence":
         tail = (" — participation is not divided, so this takes nothing from anybody: it changes how "
                 "much of the pool he is on the field to claim.")

@@ -414,6 +414,146 @@ def test_a_stale_edit_is_reported_and_changes_nothing(base) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# playing time
+# --------------------------------------------------------------------------- #
+# The one knob that is not a share of anything the engine divides. Nothing splits the snap pool -- five men
+# are on the field for the same snap -- so by the rule that governs every other share a snap share would be
+# evidence, and it was: a reader could type one and no projected number moved. It is spent instead as a
+# multiplier on every *other* claim the man makes, because that is what a snap share means: more of the
+# game, and therefore more of everything he is out there to claim. The exclusive pools then settle, so the
+# targets and carries he gains come off the teammates he is on the field instead of.
+#
+# Four things have to hold for that to be trustworthy, and each is a test below: the multiplier is exactly
+# one until somebody types (or the whole board would drift); typing the estimated value is a no-op; the edit
+# reaches the stat line; and the pool it lands in still ties out to its measured target afterwards.
+@pytest.fixture(scope="module")
+def snaps(base) -> dict:
+    """A second receiver: enough snaps to have a rate, and enough room left to raise it into."""
+    men = base.shares.join(
+        base.roster.select("player_id", "player", "position", "team", "depth_slot"), on="player_id"
+    )
+    mine = men.filter(
+        (pl.col("position") == "WR") & (pl.col("depth_slot") == 2) & (pl.col("snap_share") > 0.35)
+    )
+    if mine.is_empty():
+        pytest.skip("no second receiver with a real snap share")
+    return mine.sort("snap_share").row(0, named=True)
+
+
+def test_playing_time_is_exactly_one_until_somebody_types(base) -> None:
+    col = base.shares[overrides.PLAYING_TIME]
+    assert col.null_count() == 0
+    assert col.min() == 1.0 and col.max() == 1.0
+
+
+def test_typing_the_estimated_snap_share_changes_nothing(base, snaps) -> None:
+    """The multiplier is a ratio to the model's own number, so the identity edit has to be the identity.
+
+    Not a formality: the measured share already contains his measured playing time, so if this drifted
+    then every unedited player would be projected off a number nobody chose.
+    """
+    same = overrides.run(
+        Scenario(name="same").set(
+            Override("player", snaps["player_id"], "snap_share", "set", float(snaps["snap_share"]))),
+        PROJ_SEASON,
+    )
+    assert same.shares.filter(pl.col("player_id") == snaps["player_id"])[
+        overrides.PLAYING_TIME][0] == pytest.approx(1.0)
+    assert overrides.diff(base.board, same.board).is_empty()
+
+
+@pytest.fixture(scope="module")
+def more_snaps(snaps) -> overrides.Run:
+    return overrides.run(
+        Scenario(name="snaps").set(
+            Override("player", snaps["player_id"], "snap_share", "multiply", 1.25)),
+        PROJ_SEASON,
+    )
+
+
+def test_more_snaps_is_more_of_everything_he_claims(base, snaps, more_snaps) -> None:
+    pid = snaps["player_id"]
+    assert more_snaps.shares.filter(pl.col("player_id") == pid)[
+        overrides.PLAYING_TIME][0] == pytest.approx(1.25)
+    was = base.board.filter(pl.col("player_id") == pid).row(0, named=True)
+    now = more_snaps.board.filter(pl.col("player_id") == pid).row(0, named=True)
+    # the snaps themselves, which is the share he typed
+    assert now["offense_snaps"] > was["offense_snaps"] * 1.2
+    # and the claims he makes in them, which is the point: a share he never touched moved with his snaps
+    for stat in ("targets", "receptions", "receiving_yards", "fantasy_points"):
+        assert now[stat] > was[stat] * 1.1, stat
+
+
+def test_what_he_gains_his_room_gives_up(base, snaps, more_snaps) -> None:
+    """The edit is conserved, which is what makes it a projection rather than a wish."""
+    moved = overrides.diff(base.board, more_snaps.board).filter(pl.col("team") == snaps["team"])
+    him = moved.filter(pl.col("player_id") == snaps["player_id"]).row(0, named=True)
+    others = moved.filter(pl.col("player_id") != snaps["player_id"])
+    assert him["d_targets"] > 0.0
+    assert others.height > 0
+    assert others["d_targets"].sum() == pytest.approx(-him["d_targets"], rel=0.02)
+    week = more_snaps.opp.filter(pl.col("week") == more_snaps.opp["week"].min())
+    team_sum = week.filter(pl.col("team") == snaps["team"])["share_targets"].sum()
+    assert team_sum == pytest.approx(opportunity.measure_targets()["targets"], abs=1e-6)
+
+
+def test_a_share_he_typed_himself_is_not_scaled_by_his_snaps(base, snaps) -> None:
+    """`lock_edited_shares` means an override is the number used. Two edits do not multiply into one.
+
+    Otherwise a reader who stated both a snap share and a target share would get neither: the engine
+    would take the target share he asked for and then quietly scale it by the other thing he asked for.
+    """
+    pid = snaps["player_id"]
+    stated = float(base.shares.filter(pl.col("player_id") == pid)["target_share"][0])
+    both = overrides.run(
+        Scenario(name="both").set(
+            Override("player", pid, "snap_share", "multiply", 1.3),
+            Override("player", pid, "target_share", "set", stated),
+        ),
+        PROJ_SEASON,
+    )
+    assert both.shares.filter(pl.col("player_id") == pid)["target_share"][0] == pytest.approx(stated)
+    was = base.board.filter(pl.col("player_id") == pid).row(0, named=True)
+    now = both.board.filter(pl.col("player_id") == pid).row(0, named=True)
+    assert now["targets"] == pytest.approx(was["targets"], rel=0.02)   # the number he stated, unscaled
+    assert now["offense_snaps"] > was["offense_snaps"] * 1.2           # the snaps he stated, honoured
+
+
+def test_a_quarterbacks_playing_time_reaches_the_queue(base) -> None:
+    """The dropback pool is filled in depth order rather than by tilt, so it needs its own check."""
+    qbs = base.shares.join(base.roster.select("player_id", "position", "team", "depth_slot"),
+                           on="player_id").filter(
+        (pl.col("position") == "QB") & (pl.col("depth_slot") == 2) & (pl.col("qb_snap_share") > 0.3))
+    if qbs.is_empty():
+        pytest.skip("no backup quarterback with a projected snap share")
+    him = qbs.row(0, named=True)
+    less = overrides.run(
+        Scenario(name="bench").set(
+            Override("player", him["player_id"], "qb_snap_share", "multiply", 0.5)),
+        PROJ_SEASON,
+    )
+    was = base.board.filter(pl.col("player_id") == him["player_id"]).row(0, named=True)
+    now = less.board.filter(pl.col("player_id") == him["player_id"]).row(0, named=True)
+    assert now["attempts"] < was["attempts"] * 0.75
+    assert now["passing_yards"] < was["passing_yards"] * 0.75
+    # the team still throws the ball the same number of times: the man ahead of him takes it back
+    mine = base.board.filter(pl.col("team") == him["team"])["attempts"].sum()
+    theirs = less.board.filter(pl.col("team") == him["team"])["attempts"].sum()
+    assert theirs == pytest.approx(mine, rel=0.01)
+
+
+def test_playing_time_cannot_be_pushed_past_the_cap(base, snaps) -> None:
+    """A man cannot be on the field three times as much as he was measured at, whatever is typed."""
+    silly = overrides.run(
+        Scenario(name="silly").set(
+            Override("player", snaps["player_id"], "snap_share", "multiply", 50.0)),
+        PROJ_SEASON,
+    )
+    assert silly.shares.filter(pl.col("player_id") == snaps["player_id"])[
+        overrides.PLAYING_TIME][0] == pytest.approx(overrides.PLAYING_TIME_CAP)
+
+
+# --------------------------------------------------------------------------- #
 # one game rather than the season
 # --------------------------------------------------------------------------- #
 # A per-game edit is the same edit as a season one at a different grain, so what is tested here is that

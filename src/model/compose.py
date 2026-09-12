@@ -51,7 +51,7 @@ from src.data import history, lake
 from src.model import efficiency, opportunity
 
 # What a player's week looks like when composition is done. Order is the display order.
-COUNT_COLUMNS = ("offense_snaps", "routes", "rush_plays", "targets", "carries", "dropbacks")
+COUNT_COLUMNS = ("offense_snaps", "routes", "targets", "carries", "dropbacks")
 
 PASS_COLUMNS = ("attempts", "completions", "passing_yards", "passing_tds", "interceptions",
                 "sacks", "passing_air_yards")
@@ -65,6 +65,23 @@ STAT_COLUMNS = COUNT_COLUMNS + PASS_COLUMNS + RUSH_COLUMNS + REC_COLUMNS + ("fum
 
 # columns that are counts of events and therefore sum over a season; everything else is derived
 SEASON_SUM = STAT_COLUMNS + ("fantasy_points",)
+
+# What `_stat_line` below actually multiplies. Both tuples are shorter than the lists they are drawn
+# from, and deliberately so: touchdowns come from pools rather than rates (see above), so `pass_td_rate`
+# is carried and never read; a red-zone share says who is on the field near the goal line and the score
+# itself is divided from the team's total, so `rz_targets` is an opportunity count and not a stat input.
+#
+# Named here rather than left implicit because one surface needs to know it. "Does editing this number
+# change anything I can see" is the question the override layer answers out of these two tuples --
+# `overrides.INERT_*` is the complement of them -- and before they existed the app offered thirteen
+# player knobs and ten team knobs that reached no projected stat at all. `tests/test_compose.py` reads
+# `_stat_line`'s own source and fails if either tuple drifts from what the arithmetic reads.
+STAT_RATES = ("attempt_rate", "completion_pct", "yards_per_attempt", "air_yards_per_attempt",
+              "int_rate", "sack_rate", "scramble_rate", "scramble_ypc", "designed_rush_ypc",
+              "catch_rate", "yards_per_target", "yards_per_carry", "fumble_rate", "qb_fumble_rate")
+
+STAT_POOLS = ("targets", "carries", "dropbacks", "air_yards", "designed_qb_rushes",
+              "passing_tds", "rushing_tds", "receiving_tds")
 
 EPS = 1e-9
 
@@ -210,9 +227,148 @@ def weekly(
     counts = [c for c in COUNT_COLUMNS if c in out.columns]
     stats = [c for c in STAT_COLUMNS if c not in counts]
     out = out.select(*keep, *[pl.col(c).fill_null(0.0) for c in counts], *stats)
-    return out.with_columns(
-        history.fantasy_points(out.columns, settings.scoring)
-    ).sort(["team", "week", "position", "depth_slot"])
+    out = out.with_columns(history.fantasy_points(out.columns, settings.scoring))
+    # and then the weeks that have already been played stop being a projection. Here rather than in
+    # `seasonal` so that every caller sees one season: a per-week page, a season total and the team
+    # reconciliation are all reading the same frame, and none of them can disagree about week 1.
+    return actualise(out, season, settings).sort(["team", "week", "position", "depth_slot"])
+
+
+# --------------------------------------------------------------------------- #
+# a week that has already happened
+# --------------------------------------------------------------------------- #
+# Columns that are a proportional split of a column we do measure. A quarterback's carries are counted and
+# his scrambles are not, but scrambles and designed runs are the two halves of his carries, so the honest
+# estimate is the actual total divided by the projected proportion -- which keeps the identity `designed +
+# scrambles = carries` exact against the real number rather than approximate against a made-up one.
+SPLITS = {"carries": ("designed_rushes", "scrambles"),
+          "rushing_yards": ("designed_rush_yards", "scramble_yards")}
+
+# Neither measured nor a split of anything measured: nobody publishes routes run. Scaled by the playing
+# time he actually had, which is the same assumption the snap-share knob makes and is first-order true.
+BY_PLAYING_TIME = ("routes",)
+
+PLAYED_COL = "is_result"          # this row is what happened, not what we think will happen
+SNAP_RATIO_CAP = 3.0
+
+
+def actualise(
+    wk: pl.DataFrame,
+    season: int = PROJ_SEASON,
+    settings: Settings | None = None,
+) -> pl.DataFrame:
+    """Replace the weeks that have been played with what actually happened in them.
+
+    The one change that turns a preseason projection into an in-season one. A season total here is a sum
+    over the weekly frame, so substituting a completed week is all it takes for the total to become
+    results-to-date plus the projected rest -- `seasonal`, `board`, the ranks, `points_per_game` and
+    `if_healthy` all follow without knowing anything about it.
+
+    Substituted per (team, week) rather than per week, because a Thursday result and a bye are both real:
+    two teams in the same league week are not the same distance into their seasons, and a league-wide cut
+    would either sit on a Thursday game for four days or zero out a game nobody has played.
+
+    Three rules, in order of how much they are trusted:
+
+      measured          the stat line as recorded -- which is every column the scoring dict can pay for,
+                        so a substituted week can price itself and the points are what he scored
+      split             a projected proportion applied to a measured total (`SPLITS`)
+      by playing time   the projection rescaled to the snaps he actually took (`BY_PLAYING_TIME`)
+
+    `p_play` becomes the 0 or 1 he really was, which matters more than it sounds: `games` is the sum of
+    `p_play`, so without this a man who was inactive in week 1 is still credited with 0.94 of a game he
+    did not play, and every per-game number downstream is divided by a games count that is part fact and
+    part forecast. A man with no result row in a completed week did not play; that is what a missing row
+    in a finished game means.
+
+    Off for any season but the one in progress, and that guard is load-bearing rather than tidy: the
+    backtest projects a finished season and scores it against exactly these tables, so substituting them
+    there would report a perfect model. `settings.use_actuals` turns it off for a reader who wants to see
+    what the model would have said on its own.
+    """
+    settings = settings or Settings()
+    if not settings.use_actuals or season != PROJ_SEASON or wk.is_empty():
+        return wk.with_columns(pl.lit(False).alias(PLAYED_COL)) if PLAYED_COL not in wk.columns else wk
+
+    from src.data import inseason
+
+    done = inseason.team_weeks(season)
+    if done.is_empty():
+        return wk.with_columns(pl.lit(False).alias(PLAYED_COL))
+    got = inseason.player_weeks(season)
+
+    # which rows of the projection are about a game that has been played
+    out = wk.join(done.with_columns(pl.lit(True).alias(PLAYED_COL)), on=["team", "week"], how="left")
+    out = out.with_columns(pl.col(PLAYED_COL).fill_null(False))
+    if not out[PLAYED_COL].any():
+        return out
+
+    measured = [c for c in inseason.MEASURED if c in out.columns]
+    if got.is_empty():
+        # the games are in the books and the player table is not: better to leave the projection alone
+        # than to zero out a whole week of players on the strength of a missing file
+        return out
+    actual = got.select("player_id", "week", *[pl.col(c).alias(f"act_{c}") for c in measured],
+                        pl.col("played").alias("act_played"))
+    out = out.join(actual, on=["player_id", "week"], how="left")
+
+    done_row = pl.col(PLAYED_COL)
+    # he was there if the results say so; a man with no row in a finished game was not
+    played = pl.col("act_played").fill_null(0.0)
+    # how much of his projected playing time he actually had, for the columns nobody publishes
+    proj_snaps = pl.col("offense_snaps").fill_null(0.0)
+    ratio = (
+        pl.when(pl.col("act_offense_snaps").fill_null(0.0) > 0)
+        .then((pl.col("act_offense_snaps") / pl.max_horizontal(proj_snaps, pl.lit(EPS)))
+              .clip(0.0, SNAP_RATIO_CAP))
+        .otherwise(played)          # no snap number published: he played or he did not
+        if "act_offense_snaps" in out.columns else played
+    )
+
+    subs = [
+        pl.when(done_row).then(played).otherwise(pl.col("p_play")).alias("p_play"),
+        *[pl.when(done_row).then(pl.col(f"act_{c}").fill_null(0.0)).otherwise(pl.col(c)).alias(c)
+          for c in measured],
+        *[pl.when(done_row).then(pl.col(c).fill_null(0.0) * ratio).otherwise(pl.col(c)).alias(c)
+          for c in BY_PLAYING_TIME if c in out.columns],
+    ]
+    out = out.with_columns(subs)
+
+    # The splits, after the substitution so the parent is already the measured total. Both parts are
+    # written in one `with_columns` and that is not a style choice: `whole` is an expression over the
+    # parts, so writing them one at a time re-evaluates the denominator against a part that has already
+    # been replaced, and the second one comes out scaled by the first. The parts must be divided by the
+    # projection they came from, which means they all have to be read before any of them is written.
+    for parent, parts in SPLITS.items():
+        have = [c for c in parts if c in out.columns]
+        if len(have) != 2 or parent not in out.columns:
+            continue
+        whole = pl.sum_horizontal([pl.col(c).fill_null(0.0) for c in have])
+        total = pl.col(parent).fill_null(0.0)
+        # A measured carry on a man the model gave no rushing projection at all -- a third quarterback,
+        # a kneel-down -- has no proportion to divide by. It goes to the first part, which is the
+        # designed run, because that is what an unprojected quarterback carry almost always is and
+        # because the alternative is a parent that its own parts do not add back to.
+        out = out.with_columns([
+            pl.when(done_row)
+            .then(pl.when(whole > EPS).then(total * pl.col(part).fill_null(0.0) / whole)
+                  .otherwise(total if part == have[0] else pl.lit(0.0)))
+            .otherwise(pl.col(part)).alias(part)
+            for part in have
+        ])
+
+    # and the dropback, which is the sum of its three fates rather than anything published
+    if {"dropbacks", "attempts", "sacks", "scrambles"} <= set(out.columns):
+        target = measure_dropback_split()
+        fates = pl.col("attempts") + pl.col("sacks") + pl.col("scrambles")
+        out = out.with_columns(
+            pl.when(done_row).then(fates / max(target, EPS)).otherwise(pl.col("dropbacks"))
+            .alias("dropbacks")
+        )
+
+    out = out.drop([c for c in out.columns if c.startswith("act_")])
+    # priced with this scenario's scoring rather than with anybody else's idea of fantasy points
+    return out.with_columns(history.fantasy_points(out.columns, settings.scoring))
 
 
 def seasonal(

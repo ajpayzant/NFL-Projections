@@ -90,15 +90,34 @@ MODES = ("set", "multiply")
 LEAGUE_FIELDS = ("normalize_pools", "pool_tilt", "lock_edited_shares", "use_context_factors",
                  "market_weight", "schedule_renormalise", "context_k", "team_weight_recent",
                  "team_keep_vs_mean", "games_projected", "tier_size", "recency",
-                 "status_availability")
+                 "status_availability", "use_actuals", "use_inseason_form")
 
-# Per-game team numbers worth editing: the pools the players divide, and the rates their efficiency
-# is scaled by. Deliberately not every column in the environment -- editing `points` alone would move
-# nothing downstream, and offering a knob that does nothing is worse than not offering it.
-TEAM_FIELDS = ("plays", "dropbacks", "pass_attempts", "carries", "targets", "air_yards",
-               "late_down_targets", "pass_tds", "rush_tds", "red_zone_trips", "red_zone_targets",
-               "red_zone_carries", "inside_5_carries", "short_yardage_carries", "seconds_per_play",
-               "yards_per_attempt", "yards_per_carry", "success_rate", "implied_points")
+# Per-game team numbers worth editing: the pools the players divide, and the rates their efficiency is
+# scaled by. Deliberately not every column in the environment -- offering a knob that does nothing is
+# worse than not offering it -- and the same +10% sweep that found the dead player knobs found ten dead
+# ones here, which are now below rather than in this tuple.
+#
+# `pass_attempts` is one of them for a reason worth stating: attempts are not projected, they are what is
+# left of a dropback after the sacks and scrambles come out (see `compose`), so `dropbacks` is the knob
+# and this was a second, contradicting way to say it.
+#
+# `implied_points` is the exception to the sweep and the reason the sweep is not the whole test. It moves
+# no player's stat line, and for a good reason: the market is already spent upstream in `team`, where a
+# fitted weight blends the line into the team's points and a fitted slope per metric tilts the per-game
+# volumes, all before this frame exists. But `standings` divides expected wins and points for/against
+# straight out of this column, so the edit does reach a projection -- the league table rather than the
+# board. A knob is kept when it moves anything the app shows, not only when it moves fantasy points.
+TEAM_FIELDS = ("plays", "dropbacks", "carries", "targets", "air_yards", "pass_tds", "rush_tds",
+               "yards_per_attempt", "yards_per_carry", "implied_points")
+
+# Team numbers the environment reports and nothing downstream reads. `red_zone_trips` and
+# `seconds_per_play` reach no later stage at all -- touchdowns are divided from the team's projected
+# total and plays are projected directly rather than from pace -- and the red-zone and late-down pools
+# are divided among claimants without any stat being computed from the result. `success_rate` reaches
+# exactly one rate, `rush_success_rate`, which the stat line does not read either.
+TEAM_EVIDENCE_FIELDS = ("pass_attempts", "late_down_targets", "red_zone_trips", "red_zone_targets",
+                        "red_zone_carries", "inside_5_carries", "short_yardage_carries",
+                        "seconds_per_play", "success_rate")
 
 # `expected_games` is the availability knob; `active_weeks` is derived from it rather than edited, so
 # the two cannot be set to disagree.
@@ -120,11 +139,61 @@ ROSTER_FIELD = "on_roster"
 ROSTER_FIELDS = (ROSTER_FIELD,)
 OFF_ROSTER = 0.0
 
-# Deduplicated because the two frames overlap: `snap_share` and the participation metrics are both a
-# player's own number and a share of a non-exclusive pool, so they appear in each list.
+# --------------------------------------------------------------------------- #
+# knobs that reach the projection, and knobs that do not
+# --------------------------------------------------------------------------- #
+# A number is worth offering only if changing it changes something. Measured by nudging every field by
+# +10% on the top man of all 32 teams and re-running the whole engine (`scripts/knob_leverage.py`), the
+# surface divided in two: 24 player fields moved his projected points, and 13 moved nothing a stat is
+# computed from. The dead ones are not a bug -- they are the shape of the model, stated in
+# `compose.STAT_RATES` and `compose.STAT_POOLS`. Touchdowns are divided from the team's total, so the
+# red-zone shares describe who is near the goal line without deciding who scores; targets come from
+# `target_share`, so `tprr` and `adot` are carried for the room tables and never read; a snap is claimed
+# out of a shared pool nothing divides by. Every one of them is still worth *seeing* -- that is what
+# `EVIDENCE_FIELDS` is -- but a knob a user turns for twenty minutes with no effect on the board is worse
+# than no knob, and the complaint that the sheet is overwhelming is mostly these thirteen.
+INERT_RATES = tuple(m for m in efficiency.RATE_METRICS if m not in compose.STAT_RATES)
+
+_POOL_OF = {s: p.name for p in opportunity.POOLS for s in p.shares}
+INERT_SHARES = tuple(m for m in opportunity.SHARE_METRICS
+                     if _POOL_OF.get(m) not in compose.STAT_POOLS)
+
+EDITABLE_SHARES = tuple(m for m in opportunity.SHARE_METRICS if m not in INERT_SHARES)
+EDITABLE_RATES = tuple(m for m in efficiency.RATE_METRICS if m not in INERT_RATES)
+
+# Playing time, and the one place the "does a stat divide this pool?" test above is the wrong test.
+#
+# Nothing divides the snap pool -- five men are on the field for the same snap -- so by the rule that
+# governs every other share these two would be evidence, and they were. But a snap share is not a claim
+# on snaps the way a target share is a claim on targets: it is *how much of the game a man is out there
+# for*, and every other claim he makes is made in the snaps he plays. So it is offered as a knob and
+# spent as one: `opportunity` scales his claim on every other pool by how far his snap share has been
+# moved from the model's own estimate of it, and the exclusive pools then settle, so the targets and
+# carries he gains are taken off the teammates he is now on the field instead of.
+#
+# The measured share already contains his measured playing time, so the multiplier is 1.000 at the
+# estimated value and this changes nothing until somebody types. What it assumes is that his rate *per
+# snap* holds -- 50% more snaps is 50% more targets -- which is the first-order truth and is what a
+# reader means by the edit. A share he typed himself is exempt: `lock_edited_shares` makes an override
+# mean what it says, so a typed target share is not then scaled by a typed snap share.
+#
+# Season-wide only, and deliberately not in `GAME_FIELDS`: for one week the knob is `p_play`, exactly as
+# the season-long count of games is `expected_games` and never a season-wide `p_play`.
+PLAYING_TIME_METRICS = ("snap_share", "qb_snap_share")
+
+# The numbers a user reads and cannot type over.
+EVIDENCE_FIELDS = tuple(dict.fromkeys(
+    tuple(m for m in INERT_SHARES if m not in PLAYING_TIME_METRICS) + INERT_RATES
+))
+
+# Deduplicated because the two frames overlap: the participation metrics are both a player's own number
+# and a share of a non-exclusive pool, so they appear in each list. `route_participation` is in neither --
+# it is evidence, above, and the snap share is the knob that moves it.
 PLAYER_FIELDS = tuple(dict.fromkeys(
-    AVAILABILITY_FIELDS + roster.PARTICIPATION_METRICS
-    + opportunity.SHARE_METRICS + efficiency.RATE_METRICS
+    AVAILABILITY_FIELDS
+    + PLAYING_TIME_METRICS
+    + tuple(m for m in roster.PARTICIPATION_METRICS if m not in EVIDENCE_FIELDS)
+    + EDITABLE_SHARES + EDITABLE_RATES
 ))
 
 # His chance of playing in one particular game. Only ever a per-game edit, which is why it is not in
@@ -136,11 +205,11 @@ GAME_ONLY_FIELDS = ("p_play",)
 # What a player edit can say about one game: whether he is out there, and what his job is when he is.
 # Both live on the frame `opportunity` divides the pools from, so a per-game edit is subject to
 # normalisation and to the quarterback queue exactly as the season-level one is.
-GAME_FIELDS = GAME_ONLY_FIELDS + opportunity.SHARE_METRICS
+GAME_FIELDS = GAME_ONLY_FIELDS + EDITABLE_SHARES
 
 # The rates are per-game too, but on the next frame along: they are joined to his games and multiplied
 # by that game's environment factor, so an edit belongs after the join and before the stat line.
-GAME_RATE_FIELDS = efficiency.RATE_METRICS
+GAME_RATE_FIELDS = EDITABLE_RATES
 
 # Everything a week can be attached to. A player field outside this set is one number for the season.
 GAME_ALL_FIELDS = tuple(dict.fromkeys(GAME_FIELDS + GAME_RATE_FIELDS))
@@ -150,7 +219,7 @@ GAME_ALL_FIELDS = tuple(dict.fromkeys(GAME_FIELDS + GAME_RATE_FIELDS))
 # without a marker the number a user typed is not the number the projection uses. `p_play` is not here
 # even though it is edited on the same frame -- it multiplies a claim rather than being one, so it is
 # never rescaled and there is nothing to hold it against. Nor is a rate: nothing renormalises rates.
-LOCKABLE = frozenset(opportunity.SHARE_METRICS)
+LOCKABLE = frozenset(EDITABLE_SHARES)
 FIELDS = {"league": LEAGUE_FIELDS, "team": TEAM_FIELDS,
           "player": PLAYER_FIELDS + DEPTH_FIELDS + ROSTER_FIELDS + GAME_ONLY_FIELDS}
 
@@ -889,6 +958,49 @@ def _reslot(ros: pl.DataFrame, scenario: Scenario) -> tuple[pl.DataFrame, list[d
     return out.sort(["team", "position", DEPTH_FIELD]), [rec for rec, _ in asks]
 
 
+PLAYING_TIME = "playing_time"
+PLAYING_TIME_CAP = 3.0            # a man cannot be on the field three times as much as estimated
+
+
+def playing_time(shares: pl.DataFrame, estimated: pl.DataFrame) -> pl.DataFrame:
+    """Attach `playing_time`: the snap share as edited over the snap share as estimated.
+
+    One column rather than two because a player has one body: a skill player carries `snap_share` and a
+    quarterback `qb_snap_share`, they divide the same pool, and no row has both non-zero. Whichever he
+    has is the one that speaks for him, and a row with neither is 1.0 -- unedited, and therefore not
+    scaled at all, which is what makes this safe to compute on every run.
+
+    Clipped below at zero and above at `PLAYING_TIME_CAP`, and a zero *estimate* yields 1.0 rather than
+    an infinity: a man the model gives no snaps has no per-snap rate to scale, so raising his snap share
+    has to come through the depth chart or through his shares directly. `opportunity` spends it.
+    """
+    have = [m for m in PLAYING_TIME_METRICS if m in shares.columns and f"est_{m}" in estimated.columns]
+    if not have:
+        return shares.with_columns(pl.lit(1.0).alias(PLAYING_TIME))
+    out = shares.join(estimated, on="player_id", how="left")
+
+    def ratio(metric: str) -> pl.Expr:
+        est = pl.col(f"est_{metric}").fill_null(0.0)
+        return (
+            pl.when((est > 0) & pl.col(metric).is_not_null())
+            .then(pl.col(metric) / est)
+            .otherwise(None)
+        )
+
+    ratios = [ratio(m) for m in have]
+    if len(have) == 2:
+        # both columns exist on every row, so the one that speaks for him is the one the model gave him:
+        # a receiver's `qb_snap_share` estimate is ~0 and a starting quarterback's is ~0.96
+        a, b = have
+        larger = (pl.col(f"est_{a}").fill_null(0.0) >= pl.col(f"est_{b}").fill_null(0.0))
+        chosen = pl.coalesce(pl.when(larger).then(ratios[0]).otherwise(ratios[1]), *ratios, pl.lit(1.0))
+    else:
+        chosen = pl.coalesce(ratios[0], pl.lit(1.0))
+    return out.with_columns(
+        chosen.clip(0.0, PLAYING_TIME_CAP).alias(PLAYING_TIME)
+    ).drop([f"est_{m}" for m in have])
+
+
 def _rederive_availability(part: pl.DataFrame) -> pl.DataFrame:
     """`active_weeks` follows `expected_games`, so an edit to games cannot leave them disagreeing."""
     if "expected_games" not in part.columns:
@@ -989,9 +1101,15 @@ def run(
     note("participation", rec)
 
     shares = opportunity.player_shares(season, st, ros=ros, fitted=fitted)
+    estimated = shares.select("player_id", *[pl.col(m).alias(f"est_{m}") for m in PLAYING_TIME_METRICS
+                                             if m in shares.columns])
     shares, rec = apply(shares, sc, "player", "player_id", fields=opportunity.SHARE_METRICS,
                         weeks="never", lock=st.lock_edited_shares)
     note("shares", rec)
+    # how far the snap share has been moved from what the model estimated, which is what every other
+    # claim on the row is then scaled by. Computed here because this is the only place both numbers
+    # exist: `apply` returns the edited frame, and the multiplier is the ratio of the two.
+    shares = playing_time(shares, estimated)
 
     rates = efficiency.rates(season, st, ros=ros, fitted=fitted)
     rates, rec = apply(rates, sc, "player", "player_id", fields=efficiency.RATE_METRICS,

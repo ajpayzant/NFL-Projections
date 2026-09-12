@@ -1,15 +1,21 @@
 """Bring the data under the projection up to date. Safe to run any number of times.
 
-    python scripts/update_data.py                 # light: the four tables this repo owns
+    python scripts/update_data.py                 # light: the eight tables this repo owns
     python scripts/update_data.py --full          # light, after rebuilding the played-game lake
     python scripts/update_data.py --dry-run       # print the commands and stop
 
 Two speeds, because the data has two speeds:
 
 - **Light** (seconds, daily). Rosters, depth charts, schedules, injuries and draft picks change every
-  day in season and decide who is projected at all. This is `src.data.refresh`, which this repo owns.
+  day in season and decide who is projected at all. So do the three weekly results tables --
+  player_stats, snap_counts and team_stats -- which are published within hours of a game and are what
+  make an in-season projection an in-season projection: a played week becomes what happened in it, and
+  the weeks still to come learn from it. This is `src.data.refresh`, which this repo owns.
 - **Heavy** (minutes, weekly). player_games, team_games, player_usage and passer_games only change
-  after games are played. They are built by the engine repo -- `~/nfl-projection-system`, or
+  after games are played. They carry the play-by-play detail the light tables cannot -- routes run,
+  red-zone volume, the scramble/designed split -- so the metrics denominated in those keep waiting on
+  this pass, and the light one is not a substitute for it. They are built by the engine repo --
+  `~/nfl-projection-system`, or
   `$NFLSP_ENGINE_DIR` -- whose `bootstrap_data -> build_tables -> build_aggregates` chain is
   season-scoped and idempotent, so re-running it for the projection season is the whole update. This
   script does not reimplement any of it; if that repo is not on this machine the heavy pass is skipped
@@ -114,6 +120,31 @@ def light_pass(handle, season: int, dry: bool) -> int:
     return code
 
 
+def inseason_state(handle, season: int, dry: bool) -> dict:
+    """How far into the season the results now reach, which is the point of having refreshed them.
+
+    Logged rather than merely written, because it is the one line of the run that says whether the
+    projection changed: a refresh that reports eight successful fetches and still knows about no games
+    is a refresh that did nothing for the numbers on the board.
+    """
+    if dry:
+        return {}
+    from src.data import inseason, lake
+
+    lake.clear_cache()
+    inseason.clear_cache()
+    state = {"weeks_complete": inseason.weeks_complete(season),
+             "weeks_played": inseason.weeks_played(season),
+             "result_rows": int(inseason.player_weeks(season).height)}
+    if state["weeks_played"] == 0:
+        say(handle, "in season: no completed games -- every week on the board is a projection")
+    else:
+        say(handle, f"in season: complete through week {state['weeks_complete']}, "
+                    f"some teams through {state['weeks_played']}, "
+                    f"{state['result_rows']} player-game results readable")
+    return state
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -131,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"season {args.season} =====")
         heavy = heavy_pass(handle, args.season, args.dry_run) if args.full else "skipped"
         light = light_pass(handle, args.season, args.dry_run)
+        state = inseason_state(handle, args.season, args.dry_run)
         finished = datetime.now().astimezone()
         say(handle, f"finished {finished:%H:%M:%S} after {(finished - started).seconds}s  "
                     f"heavy={heavy}  light=exit {light}")
@@ -144,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         "heavy": heavy,
         "light": light,
         "seconds": (finished - started).seconds,
+        **state,
     }, indent=2) + "\n", encoding="utf-8")
     return 2 if (light >= 2 or heavy.startswith("failed")) else (1 if light == 1 else 0)
 

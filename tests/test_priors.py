@@ -243,16 +243,24 @@ def test_team_pools_match_the_team_game_table(pools):
 HISTORY_METRICS = ("target_share", "yards_per_carry", "dropback_share")
 
 
+RECORD_SEASONS = tuple(range(2021, PROJ_SEASON + 1))
+# Through the season in progress, not through the last completed one. The record has to cover every
+# season the estimate reads or the two stop being comparable, and since the estimator started blending
+# the season to date it reads this one -- an unfinished row is part of the argument a user is having with
+# the number, and leaving it out is how a test comes to assert that a weighted average sits outside the
+# seasons it averages.
+
+
 @pytest.fixture(scope="module")
 def record() -> pl.DataFrame:
     from src.model import estimate
 
-    return estimate.season_history(HISTORY_METRICS, seasons=tuple(range(2021, 2026)))
+    return estimate.season_history(HISTORY_METRICS, seasons=RECORD_SEASONS)
 
 
 def test_the_record_is_one_row_per_player_season_per_metric_with_its_denominator(record):
     assert set(record["metric"].unique().to_list()) == set(HISTORY_METRICS)
-    assert set(record["season"].unique().to_list()) <= set(range(2021, 2026))
+    assert set(record["season"].unique().to_list()) <= set(RECORD_SEASONS)
     assert record.height > 2000
     assert record["n"].null_count() == 0
     # a value is num / n wherever there was any opportunity at all

@@ -105,9 +105,16 @@ POOLS = (
     Pool("rushing_tds", "rush_tds", ("rush_td_share", "qb_rush_td_share")),
     Pool("dropbacks", "dropbacks", ("dropback_share",), queue=True),
     # participation: several players share one snap, so these are not divided and not scaled
-    Pool("offense_snaps", "plays", ("snap_share",), exclusive=False),
+    Pool("offense_snaps", "offense_snaps", ("snap_share", "qb_snap_share"), exclusive=False),
     Pool("routes", "dropbacks", ("route_participation",), exclusive=False),
-    Pool("rush_plays", "designed_rushes", ("rush_participation",), exclusive=False),
+    # There was a third here, `rush_plays` over `rush_participation`, and it was not participation at
+    # all. The play-by-play credits a designed run to the man who carried it, so the column sums to one
+    # per run rather than to the five or six players on the field for it -- `carries` under another name,
+    # correlating 0.98 with `carry_share` among backs and predicting next season's carry share no better
+    # (0.640 against 0.642). It was also populated for RB and FB only, so every receiver and tight end
+    # in the league carried a measured-looking 0.000 and a fitted prior of exactly zero stated over
+    # 55,000 designed runs. It reached no projected stat, it duplicated one that does, and the app
+    # labelled it "runs he is on the field for", which it never was.
     # not a claim on the pool but a pre-split quantity: only its ratio to the QB's projected scrambles
     # is used, to divide his clean rushes into designed runs and scrambles in `compose`.
     Pool("designed_qb_rushes", "designed_rushes", ("designed_rush_share",), exclusive=False),
@@ -175,6 +182,13 @@ def measure_targets(seasons: tuple[int, ...] | None = None) -> dict[str, float]:
 TEAM_INPUTS = ("yards_per_attempt", "yards_per_carry", "success_rate", "est_yards_per_attempt",
                "est_yards_per_carry", "est_success_rate", "pass_attempts", "designed_rushes")
 
+# A snap is not a play: an offence takes the field for snaps wiped out by an accepted penalty, which
+# never become plays. Measured 2021-2025 the gap is flat -- 65.5 snaps per 61.7 plays, 1.060 to 1.067
+# by season and sd 0.005 across the 32 teams -- so it is a unit conversion, not a second projection.
+# Without it a snap share measured against team snaps was being paid out of team plays and every snap
+# count in the app read ~6% light.
+SNAPS_PER_PLAY = 1.062
+
 GAME_CONTEXT = ("game_id", "season", "week", "team", "opponent", "is_home", "rest_days", "div_game",
                 "roof", "surface", "spread", "total", "implied_points", "has_market", "b_script")
 
@@ -199,6 +213,8 @@ def _game_frame(
         env = env.with_columns(
             (pl.col("plays") - pl.col("dropbacks")).clip(0.0).alias("designed_rushes")
         )
+    if "offense_snaps" not in env.columns and "plays" in env.columns:
+        env = env.with_columns((pl.col("plays") * SNAPS_PER_PLAY).alias("offense_snaps"))
     cols = [c for c in GAME_CONTEXT if c in env.columns]
     wanted = dict.fromkeys([p.team_col for p in POOLS] + list(TEAM_INPUTS))
     return env.select(
@@ -324,6 +340,30 @@ def _settle(claim: pl.Expr, weight: pl.Expr, want: pl.Expr, locked: pl.Expr | No
     return pl.when(locked).then(claim * kept).otherwise(settled)
 
 
+PLAYING_TIME = "playing_time"
+
+# The pool whose share *is* the playing time. Scaling a claim on it by how far that claim was moved
+# would square the edit: a snap share set to twice the estimate would pay out four times the snaps.
+PLAYING_TIME_POOL = "offense_snaps"
+
+
+def _playing_time(grid: pl.DataFrame, pool: Pool, share: str, settings: Settings) -> pl.Expr:
+    """How much a snap-share edit scales this claim on this pool. `1.0` unless somebody typed one.
+
+    Written by `overrides.playing_time`, which is the only thing that knows the estimate the edit moved
+    away from. The share he typed himself is exempt for the reason `lock_edited_shares` exists: a number
+    a user stated is the number the projection uses, and scaling a typed target share by a typed snap
+    share would be the app disagreeing with both of them.
+    """
+    if PLAYING_TIME not in grid.columns or pool.name == PLAYING_TIME_POOL:
+        return pl.lit(1.0)
+    scale = pl.col(PLAYING_TIME).fill_null(1.0)
+    held = f"{LOCK_PREFIX}{share}"
+    if held in grid.columns and settings.lock_edited_shares:
+        return pl.when(pl.col(held).fill_null(False)).then(pl.lit(1.0)).otherwise(scale)
+    return scale
+
+
 def tilt_of(settings: Settings) -> float:
     """The exponent in force: the scenario's if it set one, otherwise the fitted one, otherwise flat."""
     if settings.pool_tilt is not None:
@@ -368,7 +408,8 @@ def opportunity(
     # the lock markers ride along with the shares they belong to, so a share held at a typed value and
     # the marker saying it was typed can never end up on different rows
     marks = [f"{LOCK_PREFIX}{s}" for s in have if f"{LOCK_PREFIX}{s}" in shares.columns]
-    grid = ros.join(shares.select("player_id", *have, *marks), on="player_id", how="left").join(
+    pt = [PLAYING_TIME] if PLAYING_TIME in shares.columns else []
+    grid = ros.join(shares.select("player_id", *have, *marks, *pt), on="player_id", how="left").join(
         games, on=["season", "team"], how="inner"
     )
     if on_grid is not None:
@@ -383,7 +424,9 @@ def opportunity(
         if not parts or team_col not in grid.columns:
             continue
         raw_col = f"raw_{pool.name}"
-        raw = pl.sum_horizontal([pl.col(s).fill_null(0.0) for s in parts]) * pl.col("p_play")
+        raw = pl.sum_horizontal(
+            [pl.col(s).fill_null(0.0) * _playing_time(grid, pool, s, settings) for s in parts]
+        ) * pl.col("p_play")
         g = grid.with_columns(raw.alias(raw_col))
         want = pl.lit(targets.get(pool.name, 1.0))
         normalize = settings.normalize_pools and pool.exclusive
@@ -492,8 +535,9 @@ def team_pool_sums(
     part = roster.participation(season, settings, fitted=fitted) if part is None else part
     shares = player_shares(season, settings, fitted=fitted) if shares is None else shares
     have = [s for s in SHARE_METRICS if s in shares.columns]
+    pt = [PLAYING_TIME] if PLAYING_TIME in shares.columns else []
     grid = part.select("team", "player_id", pl.col("active_weeks").alias("p_play")).join(
-        shares.select("player_id", *have), on="player_id", how="left"
+        shares.select("player_id", *have, *pt), on="player_id", how="left"
     )
     targets = measure_targets()
 
@@ -503,7 +547,11 @@ def team_pool_sums(
         if not parts:
             continue
         want = targets.get(pool.name, 1.0)
-        raw = pl.sum_horizontal([pl.col(s).fill_null(0.0) for s in parts]) * pl.col("p_play")
+        # the same scaling the projection applies, or the audit would report a room the projection
+        # never divided
+        raw = pl.sum_horizontal(
+            [pl.col(s).fill_null(0.0) * _playing_time(grid, pool, s, settings) for s in parts]
+        ) * pl.col("p_play")
         frames.append(
             grid.group_by("team").agg(raw.sum().alias("raw_sum"), pl.len().alias("players"))
             .with_columns(

@@ -34,12 +34,19 @@ from src.config import (
 )
 
 # Datasets we refresh ourselves; OWN_RAW wins over the shared lake for these.
-OWNED = ("rosters", "depth_charts", "schedules", "injuries", "draft_picks")
+OWNED = ("rosters", "depth_charts", "schedules", "injuries", "draft_picks",
+         "player_stats", "snap_counts", "team_stats")
+
+# The three results tables, which are owned for a different reason from the rosters: not because they
+# change daily but because the shared lake's copy of the season in progress is as old as its last pbp
+# build, and an in-season projection cannot be built from last month's results. Precedence is per season,
+# so history still comes from the one place that builds it.
+RESULTS_TABLES = ("player_stats", "snap_counts", "team_stats")
 
 # What the engine actually reads, and where from. Anything not listed here is not a dependency.
 PROCESSED_TABLES = ("team_games", "player_usage", "passer_games", "player_games")
 RAW_TABLES = ("rosters", "rosters_weekly", "depth_charts", "schedules", "injuries", "draft_picks",
-              "combine")
+              "combine", *RESULTS_TABLES)
 
 
 def _roots(layer: str, dataset: str) -> list[Path]:
