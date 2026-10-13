@@ -111,8 +111,12 @@ def composite_tables(audit: pl.DataFrame, blend: dict) -> dict:
                                                        tt.select(fantasy(tt, rp)).to_series().to_numpy())}
         tds = [c for c in ("rushing_tds", "receiving_tds") if c in mm.columns]
         if tds:
-            out[f"{group}|anytime_td"] = {"emp": Empirical(mm.select(pl.sum_horizontal(tds)).to_series().to_numpy(),
-                                                           tt.select(pl.sum_horizontal(tds)).to_series().to_numpy())}
+            m_any = mm.select(pl.sum_horizontal(tds)).to_series().to_numpy()
+            t_any = tt.select(pl.sum_horizontal(tds)).to_series().to_numpy()
+            # P(1+) from a logistic-calibrated Poisson: the empirical table is flat at the top
+            # (research/td_calibration.py: RB top decile 0.498 empirical, 0.532 calibrated, 0.527 actual)
+            out[f"{group}|anytime_td"] = {"emp": Empirical(m_any, t_any),
+                                          "cal": dist.fit_td_calibration(m_any, (t_any >= 1).astype(float))}
         if "rushing_yards" in mm.columns and "receiving_yards" in mm.columns:
             out[f"{group}|rush_rec_yards"] = {"emp": Empirical(
                 mm.select(pl.col("rushing_yards") + pl.col("receiving_yards")).to_series().to_numpy(),

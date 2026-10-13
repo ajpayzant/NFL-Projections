@@ -15,10 +15,23 @@ import polars as pl
 import streamlit as st
 
 import adjust
+import cloud
 import config as C
 import dist
+import edges
+import odds
+import tracking
 
 st.set_page_config(page_title="NFL Player Projections", layout="wide")
+
+
+@st.cache_data(ttl=600, show_spinner="Loading the latest projections...")
+def _sync() -> str | None:
+    """On Streamlit Cloud: pull the refresh's newest files (no-op locally)."""
+    return cloud.sync()
+
+
+_sync()
 PROJ, ACT, MUTED = "#2a78d6", "#eb6834", "#8a8984"   # same palette as the NHL and NBA tools
 GROUP = {"QB": "QB", "RB": "RB", "WR": "WR+TE", "TE": "WR+TE"}
 
@@ -351,6 +364,9 @@ def page_depth():
     st.caption("Who plays and who starts at quarterback. The model's call comes from recent snaps, the depth chart and "
                "the injury report; change it here and every projection for this team updates (other teams are not "
                "affected). Saved edits are shared with everyone using the app.")
+    if cloud.enabled() and adjust.backend() == "file":
+        st.warning("Edits are not connected to their gist (add gist_id and github_token to the app's secrets), "
+                   "so saves only last until the app restarts.")
     qbs = cand[cand.pos == "QB"].sort_values("p_start", ascending=False)
     names = dict(zip(qbs.player_id, qbs.player_name))
     model_qb = qbs[qbs.starter].player_id.iloc[0] if qbs.starter.any() else qbs.player_id.iloc[0]
@@ -504,14 +520,258 @@ def page_model():
     st.markdown(doc.read_text(encoding="utf-8") if doc.exists() else "")
 
 
+# ---------------------------------------------------------------- Edges
+
+EDGE_POSITIONS = ["QB", "RB", "WR", "TE", "Game"]
+ODDS_COOLDOWN_MIN = 2   # the Refresh odds button: stops double clicks and public-app spam
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _odds(mtime: float) -> pd.DataFrame | None:
+    return odds.load()
+
+
+@st.cache_data(show_spinner="Comparing prices with the projections...", max_entries=8)
+def _edges(odds_mtime: float, built: str, ov_key: str) -> tuple[pd.DataFrame, dict]:
+    d = data()
+    return edges.compare(_odds(odds_mtime), games(), players(), d["tables"], d["margin"], d["total"])
+
+
+CHECK_MARKETS = {"Passing yards": "player_pass_yds", "Passing TDs": "player_pass_tds", "Completions": "player_pass_completions",
+                 "Pass attempts": "player_pass_attempts", "Interceptions": "player_pass_interceptions",
+                 "Rushing yards": "player_rush_yds", "Carries": "player_rush_attempts", "Receptions": "player_receptions",
+                 "Receiving yards": "player_reception_yds", "Rush + rec yards": "player_rush_reception_yds",
+                 "Pass + rush yards": "player_pass_rush_yds", "Anytime TD": "player_anytime_td",
+                 "Moneyline": "Moneyline", "Spread": "Spread", "Total": "Total"}
+MARKET_POS = {"player_pass_yds": ("QB",), "player_pass_tds": ("QB",), "player_pass_completions": ("QB",),
+              "player_pass_attempts": ("QB",), "player_pass_interceptions": ("QB",), "player_pass_rush_yds": ("QB",),
+              "player_rush_yds": ("QB", "RB"), "player_rush_attempts": ("RB", "QB"), "player_receptions": ("WR", "TE", "RB"),
+              "player_reception_yds": ("WR", "TE", "RB"), "player_rush_reception_yds": ("RB", "WR", "TE"),
+              "player_anytime_td": ("RB", "WR", "TE", "QB")}
+PLAY_EDGE = 0.05   # below about 5 points the books' margin usually eats the edge
+
+
+def _odds_in(label: str, default: str, key: str, help: str | None = None) -> float | None:
+    raw = st.text_input(label, value=default, key=key, help=help).strip().replace("+", "")
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if abs(v) >= 100 else None
+
+
+def check_line(expanded: bool = False):
+    """Price one line typed in from a book against this week's projection."""
+    d = data()
+    with st.expander("Check a line from a book", expanded=expanded):
+        g = games()
+        c1, c2, c3 = st.columns([2, 2, 3])
+        label = c1.selectbox("Market", list(CHECK_MARKETS), key="chk_market")
+        market = CHECK_MARKETS[label]
+        glab = {r.game_id: f"{r.away} @ {r.home}" for r in g.itertuples()}
+        gid = c2.selectbox("Game", list(glab), format_func=glab.get, key="chk_game")
+        gr = g[g.game_id == gid].iloc[0]
+        d1, d2, d3, d4 = st.columns(4)
+        side, line = None, None
+        if market in ("Moneyline", "Spread", "Total"):
+            if market == "Total":
+                side = d1.segmented_control("Side", ["Over", "Under"], default="Over", key="chk_ou") or "Over"
+                line = d2.number_input("Line", value=float(np.floor(gr.total_hat)) + 0.5, step=0.5, key="chk_tot")
+                win_push = edges.game_win_push(d["margin"], d["total"], gr, "Total", True, line, side == "Over")
+                proj_text, bet = f"{gr.total_hat:.1f} total points projected", f"{side} {line:g}, {glab[gid]}"
+            else:
+                team = c3.segmented_control("Team", [gr.away, gr.home], default=gr.away, key="chk_team") or gr.away
+                home = team == gr.home
+                fair = -(gr.margin_hat if home else -gr.margin_hat)
+                line = 0.0 if market == "Moneyline" else d2.number_input(
+                    "Spread", value=float(np.floor(fair)) + 0.5, step=0.5, key="chk_sp", help="This team's spread, e.g. -3.5")
+                win_push = edges.game_win_push(d["margin"], d["total"], gr, market, home, line)
+                own, opp = (gr.home_pts, gr.away_pts) if home else (gr.away_pts, gr.home_pts)
+                proj_text = f"projected score {team} {own:.1f} – {opp:.1f}"
+                bet = f"{team} {'moneyline' if market == 'Moneyline' else f'{line:+g}'}"
+        else:
+            p = players()
+            pg = p[(p.game_id == gid) & p.projected_position.isin(MARKET_POS[market])].sort_values("fantasy_ppr", ascending=False)
+            if pg.empty:
+                st.info("No projected players for that market in this game.")
+                return
+            who = c3.selectbox("Player", pg.index, format_func=lambda i: f"{pg.at[i, 'player_name']} · {pg.at[i, 'projected_position']} · {pg.at[i, 'team']}",
+                               key="chk_player")
+            r = pg.loc[who]
+            if market == "player_anytime_td":
+                side = d1.segmented_control("Side", ["Yes", "No"], default="Yes", key="chk_yn") or "Yes"
+                p_yes = float(r.p_anytime_td)
+                win_push = (p_yes if side == "Yes" else 1 - p_yes, 0.0)
+                proj_text, bet = f"{r.anytime_td:.2f} TDs projected", f"{r.player_name} anytime TD {side.lower()}"
+            else:
+                _, col, _ = edges.PROPS[market]
+                mu = edges.mean_of(r, col)
+                side = d1.segmented_control("Side", ["Over", "Under"], default="Over", key="chk_p_ou") or "Over"
+                line = d2.number_input("Line", value=float(np.floor(mu)) + 0.5, step=0.5, key=f"chk_line_{market}")
+                win_push = edges.prop_win_push(d["tables"], r, market, line, side == "Over")
+                proj_text, bet = f"{mu:.1f} {label.lower()} projected", f"{r.player_name} {side.lower()} {line:g} {label.lower()}"
+        with d3:
+            price = _odds_in("Book odds", "-110", "chk_odds", "American odds, e.g. -115 or +130")
+        with d4:
+            other = _odds_in("Other side's odds (optional)", "", "chk_other",
+                             "Adding the other side's price removes the book's margin from its probability")
+        if price is None:
+            st.warning("Enter the book's odds as an American price, e.g. -115 or +130.")
+            return
+        ev = edges.evaluate(*win_push, price, other)
+        a, b, c, dd, e = st.columns(5)
+        a.metric("Our probability", f"{ev['p']:.1%}", border=True, help="Given no push" if ev["push"] > 0 else None)
+        b.metric("Our fair odds", american(ev["p"]), border=True)
+        c.metric("Book probability", f"{ev['book_p']:.1%}", border=True,
+                 help="Margin removed" if ev["novig"] else "Includes the book's margin; add the other side to remove it")
+        dd.metric("Edge", f"{100 * ev['edge']:+.1f} pts", border=True)
+        e.metric("EV per $100", f"{ev['ev']:+.2f}", border=True)
+        msg = f"**{bet}** at {price:+.0f}: {proj_text}."
+        if ev["ev"] <= 0 or ev["edge"] < 0.02:
+            st.error(f"No edge. {msg} The book's price is at or above the model's fair value.")
+        elif ev["edge"] < PLAY_EDGE:
+            st.warning(f"Small edge. {msg} Edges this small rarely beat the books' margin.")
+        else:
+            st.success(f"Edge worth a look. {msg} Check the injury report and the depth chart before playing.")
+        if ev["push"] > 0:
+            st.caption(f"Push chance {ev['push']:.0%}, refunded.")
+
+
 def page_edges():
-    st.title("Edges")
-    st.info("Sportsbook odds arrive in Stage 3.")
+    odds_mtime = _mtime(odds.ODDS_FILE)
+    st.title(f"Edges · {week_title()}")
+    o = _odds(odds_mtime) if odds.ODDS_FILE.exists() else None
+    head, btn = st.columns([5, 1], vertical_alignment="bottom")
+    has_key = odds.api_key() is not None
+    last = pd.Timestamp(o.fetched_at.iloc[0]) if o is not None and len(o) else None
+    wait = last is not None and pd.Timestamp.now(tz="UTC") - last < pd.Timedelta(minutes=ODDS_COOLDOWN_MIN)
+    if btn.button("Refresh odds", type="primary", disabled=wait or not has_key, width="stretch",
+                  help=("Fetch the latest sportsbook prices now (about 3 API credits plus up to 12 per game). At most "
+                        f"once every {ODDS_COOLDOWN_MIN} minutes.") if has_key else "Needs odds_api_key in the app's secrets"):
+        with st.spinner("Fetching sportsbook odds..."):
+            try:
+                odds.fetch(verbose=False)
+            except Exception as e:
+                st.error(f"Could not fetch odds: {e}")
+                st.stop()
+        _odds.clear()
+        st.rerun()
+    if not has_key:
+        st.warning('**Refresh odds is off: no Odds API key.** On Streamlit Cloud add `odds_api_key = "..."` under the '
+                   "app's Settings -> Secrets (locally: `.streamlit/secrets.toml`). The line checker below works without it.")
+    check_line(expanded=o is None or o.empty)
+    if o is None or o.empty:
+        if has_key:
+            head.info("No sportsbook odds yet. Click **Refresh odds** to fetch them.")
+        return
+    df, stats_ = _edges(odds_mtime, data()["meta"]["built_at"], json.dumps(adjust.load(), sort_keys=True))
+    head.caption("Sportsbook prices compared with the model's own probability for the same bet, by position. "
+                 "Odds update only when you click Refresh odds.")
+    if df.empty:
+        st.info("No pregame odds match this week's games.")
+        return
+    shown = df[df.book_p.notna()].sort_values("dec", ascending=False).drop_duplicates(["game_id", "market", "bet"])
+    t_up = pd.Timestamp(o.fetched_at.iloc[0]).tz_convert("America/New_York")
+    a, b, c, d_ = st.columns(4)
+    a.metric("Odds updated", t_up.strftime("%a %I:%M %p ET"), border=True)
+    b.metric("Sportsbooks", f"{df.book.nunique()}", border=True)
+    c.metric("Bets priced", f"{len(shown):,}", border=True)
+    d_.metric("Positive EV", f"{(shown.ev > 0).sum():,}", border=True)
+    pos_tab = st.segmented_control("Position", ["All"] + EDGE_POSITIONS, default="All", key="edge_pos") or "All"
+    c1, c2, c3, c4 = st.columns(4)
+    game_order = df.sort_values("commence_time").game.drop_duplicates().tolist()
+    games_sel = c1.multiselect("Game", game_order, key="edge_games")
+    pool = df if pos_tab == "All" else df[df.position == pos_tab]
+    pool = pool[pool.game.isin(games_sel)] if games_sel else pool
+    plab = pool[pool.team.notna()].drop_duplicates("subject")
+    plab = dict(zip(plab.subject, plab.subject + " (" + plab.pos.astype(str) + ", " + plab.team.astype(str) + ")"))
+    sel_players = c2.multiselect("Player", sorted(plab), format_func=plab.get, key="edge_players", placeholder="Search a player")
+    kinds = [k for k in edges.KIND.values() if k in set(pool.kind)]
+    kind = c3.multiselect("Bet type", kinds, key="edge_type")
+    books = c4.multiselect("Sportsbooks", sorted(df.book.unique()), key="edge_books")
+    c5, c6, c7, c8, _ = st.columns([1, 1, 1, 1, 2], vertical_alignment="bottom")
+    min_ev = c5.number_input("Min EV %", value=0.0, step=1.0, format="%.0f", key="edge_min", disabled=bool(sel_players))
+    sort = c6.selectbox("Sort by", ["EV", "Edge"], key="edge_sort")
+    best = c7.toggle("Best price", value=True, key="edge_best")
+    both = c8.toggle("Both sides", value=True, key="edge_both",
+                     help="Only bets the book posts both sides of; anytime TDs (Yes only) are always shown, against the "
+                          "book's probability with its margin left in.")
+    q = pool[pool.subject.isin(sel_players)] if sel_players else pool
+    q = q[q.kind.isin(kind)] if kind else q
+    q = q[q.book.isin(books)] if books else q
+    q = q[q.novig.notna() | q.one_sided] if both else q
+    if best:
+        q = q.sort_values("dec", ascending=False).drop_duplicates(["game_id", "market", "bet"])
+    q = q if sel_players else q[q.ev * 100 >= min_ev]
+    q = q.sort_values("ev" if sort == "EV" else "edge", ascending=False)
+    t = pd.DataFrame({"Game": q.game, "Pos": q.position, "Bet": q.subject, "Line": q.line, "Projection": q.proj_text,
+                      "Book": q.book, "Book odds": [f"{x:+.0f}" for x in q.price], "Our odds": q.p_model.map(american),
+                      "Book %": (q.book_p * 100).round(), "Our %": (q.p_model * 100).round(), "Edge": q.edge * 100, "EV": q.ev * 100})
+    bar = lambda h: st.column_config.ProgressColumn(format="%d%%", min_value=0, max_value=100, width="small", help=h)
+    st.dataframe(t, hide_index=True, width="stretch", height=720, column_config={
+        "Game": st.column_config.TextColumn(width="small", pinned=True),
+        "Pos": st.column_config.TextColumn(width="small"),
+        "Bet": st.column_config.TextColumn(width="medium", pinned=True),
+        "Book": st.column_config.TextColumn(width="small"),
+        "Book odds": st.column_config.TextColumn(width="small"), "Our odds": st.column_config.TextColumn(width="small"),
+        "Book %": bar("The book's probability with its margin removed (anytime TD: with it)"),
+        "Our %": bar("The model's probability, for a game he plays"),
+        "Edge": st.column_config.NumberColumn(format="%+.1f", width="small", help="Our % minus Book %"),
+        "EV": st.column_config.NumberColumn(format="%+.1f%%", width="small", help="Expected profit per $100 at the book's odds")})
+    st.caption("**Book %** the book's probability without its margin · **Our %** the model's · **Edge** Our % − Book % · "
+               "**EV** expected profit per $100. Player props are priced for a game he plays (books void them otherwise); "
+               "game lines come from the market-free score model. A big edge is more often news the model has not seen "
+               "(an injury, a depth-chart change) than a mispriced line: check the injury report first. "
+               f"Matched {stats_.get('player props matched', 0):,} of {stats_.get('player props', 0):,} player prices.")
+    st.download_button("Download CSV", t.to_csv(index=False), "edges.csv", "text/csv")
+
+
+# ---------------------------------------------------------------- Results
+
+EDGE_MIN = {"All bets": None, "Edge 0%+": 0.0, "Edge 2%+": 0.02, "Edge 5%+": 0.05, "Edge 8%+": 0.08, "Edge 12%+": 0.12}
+BUCKET_LO = {lab: lo for lo, _, lab in tracking.BUCKETS}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _results(path: str, mtime: float) -> pd.DataFrame:
+    return pd.read_parquet(path)
 
 
 def page_results():
     st.title("Results")
-    st.info("Graded results arrive in Stage 3.")
+    st.caption("The model's final projections graded against the sportsbooks' opening (10 AM ET game day) and closing "
+               "lines: 1-unit bets at the best price of DraftKings, FanDuel, BetMGM, Caesars and Fanatics.")
+    p = tracking.RESULTS_LIVE
+    r = _results(str(p), p.stat().st_mtime) if p.exists() else pd.DataFrame()
+    if r.empty:
+        st.info("No graded games yet. `python tracking.py snapshot` stores each week's final projections and "
+                "`python tracking.py grade` grades finished games against their opening and closing lines.")
+        return
+    c1, c2, c3, c4 = st.columns([1, 2, 2, 1], vertical_alignment="bottom")
+    snap = c1.segmented_control("Price", ["Close", "Open"], default="Close", key="res_snap") or "Close"
+    r = r[r.snap == snap.lower()]
+    pos = c2.multiselect("Position", sorted(r.position.unique()), key="res_pos")
+    kind = c3.multiselect("Bet type", sorted(r.kind.unique()), key="res_kind")
+    th = EDGE_MIN[c4.selectbox("Bets", list(EDGE_MIN), index=3, key="res_edge")]
+    q = r[r.position.isin(pos)] if pos else r
+    q = q[q.kind.isin(kind)] if kind else q
+    sel = q if th is None else q[q.bucket.map(BUCKET_LO) >= th]
+    bets, wins, pnl = sel.bets.sum(), sel.wins.sum(), sel.pnl.sum()
+    a, b, c, d = st.columns(4)
+    a.metric("Bets", f"{int(bets):,}", border=True)
+    b.metric("Win rate", f"{wins / bets:.1%}" if bets else "—", border=True)
+    c.metric("ROI", f"{pnl / bets:+.1%}" if bets else "—", border=True)
+    d.metric("Profit", f"{pnl:+,.1f} u" if bets else "—", border=True)
+    g = sel.groupby(["position", "kind", "side"], observed=True)[["bets", "wins", "pnl"]].sum().reset_index()
+    g = g[g.bets > 0].assign(**{"Win %": lambda x: 100 * x.wins / x.bets, "ROI": lambda x: 100 * x.pnl / x.bets})
+    st.dataframe(g.rename(columns={"position": "Pos", "kind": "Market", "side": "Side", "bets": "Bets", "pnl": "Profit (u)"})
+                 [["Pos", "Market", "Side", "Bets", "Win %", "ROI", "Profit (u)"]], hide_index=True, width="stretch",
+                 column_config={"Win %": st.column_config.NumberColumn(format="%.1f%%"), "ROI": st.column_config.NumberColumn(format="%+.1f%%"),
+                                "Profit (u)": st.column_config.NumberColumn(format="%+.1f")})
+    acc = q[q.primary]
+    if acc.bets.sum():
+        st.caption(f"Accuracy (log loss, lower is better): model **{acc.ll_model.sum() / acc.bets.sum():.4f}** · books "
+                   f"**{acc.ll_mkt.sum() / acc.bets.sum():.4f}**, on {int(acc.bets.sum()):,} bets.")
 
 
 _start = os.environ.get("APP_PAGE", "slate")  # headless tests pick the page to open

@@ -94,3 +94,27 @@ class GameDist:
         """(P(outcome > line), P(outcome == line))."""
         v, p = self.pmf(m)
         return float(p[v > line].sum()), float(p[v == line].sum())
+
+
+def fit_td_calibration(mu: np.ndarray, scored: np.ndarray) -> tuple[float, float]:
+    """Logistic calibration of the Poisson P(1+ TD): logit p = a + b logit(1 - exp(-mu)).
+
+    The empirical table is calibrated on average but flat at the top -- few backs in its history were
+    projected for a touchdown a game, so Derrick Henry at 0.95 and a 0.7 back both read 52%. This keeps
+    the Poisson's shape, which extrapolates, and lets history set its level and slope."""
+    from scipy.optimize import minimize
+    x = np.log(np.clip(1 - np.exp(-np.clip(mu, 1e-4, None)), 1e-6, 1 - 1e-6))
+    x = x - np.log1p(-np.exp(x))
+    def nll(c):
+        p = 1 / (1 + np.exp(-(c[0] + c[1] * x)))
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        return -np.mean(scored * np.log(p) + (1 - scored) * np.log(1 - p))
+    r = minimize(nll, [0.0, 1.0], method="Nelder-Mead")
+    return float(r.x[0]), float(r.x[1])
+
+
+def td_probability(c: tuple[float, float], mu) -> np.ndarray:
+    mu = np.clip(np.atleast_1d(np.asarray(mu, float)), 1e-4, None)
+    p0 = np.clip(1 - np.exp(-mu), 1e-6, 1 - 1e-6)
+    x = np.log(p0 / (1 - p0))
+    return 1 / (1 + np.exp(-(c[0] + c[1] * x)))

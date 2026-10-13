@@ -31,6 +31,7 @@ import adjust
 import availability as A
 import config as C
 import correct
+import dist
 import gamelines as G
 
 C.engine_on_path()
@@ -123,7 +124,8 @@ def project(season: int, wk: int, cand: pl.DataFrame) -> pl.DataFrame:
         tds = [c for c in ("rushing_tds", "receiving_tds") if c in g.columns]
         anytime = g.select(pl.sum_horizontal([pl.col(c).fill_null(0) for c in tds])).to_series().to_numpy()
         cols["anytime_td"] = anytime
-        cols["p_anytime_td"] = model["dist"][f"{group}|anytime_td"]["emp"].p_at_least_one(anytime)
+        d_any = model["dist"][f"{group}|anytime_td"]
+        cols["p_anytime_td"] = dist.td_probability(d_any["cal"], anytime) if "cal" in d_any else d_any["emp"].p_at_least_one(anytime)
         parts.append(g.with_columns([pl.Series(k, v) for k, v in cols.items()]))
     p = pl.concat(parts, how="diagonal")
     games = storage.load("games", layer="processed", seasons=[season]).filter(pl.col("week") == wk)
@@ -138,6 +140,8 @@ def game_lines(season: int, wk: int) -> pl.DataFrame:
     out = G.predict(model, rows)
     g = storage.load("games", layer="processed", seasons=[season]).select(
         "game_id", "kickoff_et", "home_score", "away_score", "roof", "temp", "wind", "spread_line", "total_line")
+    names = pl.read_parquet(C.ENGINE / "data/raw/teams.parquet").select("team_abbr", "team_name").unique("team_abbr")
+    out = out.join(names.rename({"team_abbr": "home", "team_name": "home_name"}), on="home", how="left")         .join(names.rename({"team_abbr": "away", "team_name": "away_name"}), on="away", how="left")
     return out.join(g, on="game_id", how="left").with_columns(
         ((pl.col("total_hat") + pl.col("margin_hat")) / 2).alias("home_pts"),
         ((pl.col("total_hat") - pl.col("margin_hat")) / 2).alias("away_pts")).sort("kickoff_et")
