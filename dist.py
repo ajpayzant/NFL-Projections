@@ -69,3 +69,28 @@ def win_push(tables: dict, group: str, stat: str, mu: float, line: float, over: 
         ge = float(p_over(tables, group, stat, [mu], line - 0.5)[0])
         return (gt if over else 1 - ge), max(ge - gt, 0.0)
     return (gt if over else 1 - gt), 0.0
+
+
+class GameDist:
+    """Final margin and total given the model's projection, read from history.
+
+    NFL margins pile up on key numbers (3, 7, 10) and a normal around the projection does not know it,
+    so a spread of -3 or -3.5 was priced as if 3 were any other number. Here the outcome for a projected
+    margin m is the distribution of actual margins over walk-forward games whose projection was near m
+    (Gaussian kernel on the projection): it carries the key numbers and the model's own out-of-sample
+    error at once (P(margin = 3) is 8.7% near a 3-point projection; a normal gives 3.1%). Same for totals.
+    """
+
+    def __init__(self, pred: np.ndarray, actual: np.ndarray, bandwidth: float = 2.0):
+        self.pred, self.actual, self.h = np.asarray(pred, float), np.asarray(actual, float), bandwidth
+
+    def pmf(self, m: float) -> tuple[np.ndarray, np.ndarray]:
+        w = np.exp(-0.5 * ((self.pred - m) / self.h) ** 2)
+        vals, idx = np.unique(np.round(self.actual), return_inverse=True)
+        mass = np.bincount(idx, weights=w)
+        return vals, mass / mass.sum()
+
+    def p_over(self, m: float, line: float) -> tuple[float, float]:
+        """(P(outcome > line), P(outcome == line))."""
+        v, p = self.pmf(m)
+        return float(p[v > line].sum()), float(p[v == line].sum())

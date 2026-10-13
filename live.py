@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import polars as pl
 
+import adjust
 import availability as A
 import config as C
 import correct
@@ -38,7 +39,6 @@ from src.features import expected  # noqa: E402
 from src.projections import week as engine_week  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
-OVERRIDE_FILE = C.OVERRIDES / "overrides.json"
 STAT_GROUP = {"QB": "QB", "RB": "RB", "WR": "WR+TE", "TE": "WR+TE"}
 
 
@@ -61,10 +61,6 @@ def next_week(season: int = C.CURRENT_SEASON) -> int | None:
 
 # ---------------------------------------------------------------- who plays
 
-def load_overrides() -> dict:
-    return json.loads(OVERRIDE_FILE.read_text()) if OVERRIDE_FILE.exists() else {}
-
-
 def who_plays(season: int, wk: int) -> pl.DataFrame:
     """Every candidate with p_play / p_start, the model's call, and the user's edits applied."""
     models = pickle.load(open(A.MODEL_FILE, "rb"))
@@ -74,7 +70,7 @@ def who_plays(season: int, wk: int) -> pl.DataFrame:
         pl.col("in_lineup").fill_null(False))
     pred = pred.with_columns((pl.col("in_lineup") & (pl.col("pos") == "QB")).alias("starter"),
                              pl.lit("model").alias("source"))
-    for k, v in load_overrides().items():          # "season:week:team" -> {"out": [...], "in": [...], "qb": id}
+    for k, v in adjust.load().items():          # "season:week:team" -> {"out": [...], "in": [...], "qb": id}
         s, w, team = k.split(":")
         if int(s) != season or int(w) != wk:
             continue
@@ -93,6 +89,15 @@ def who_plays(season: int, wk: int) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------- the slate
+
+def backup_lineup(cand: pl.DataFrame) -> pl.DataFrame:
+    """Every team's lineup with its likeliest backup QB starting instead (for the Depth charts tab's QB
+    swap: one engine run re-projects every team under its backup, since teams do not interact)."""
+    q = cand.filter(pl.col("pos") == "QB").sort("p_start", "p_play", descending=True)
+    backup = q.filter(~pl.col("starter")).group_by("game_id", "team").first().select("game_id", "team", "player_id")
+    skill = cand.filter(pl.col("in_lineup") & (pl.col("pos") != "QB"))
+    return pl.concat([skill, cand.join(backup, on=["game_id", "team", "player_id"], how="semi")], how="diagonal_relaxed")         .with_columns(pl.lit(True).alias("in_lineup"))
+
 
 def project(season: int, wk: int, cand: pl.DataFrame) -> pl.DataFrame:
     lineup = cand.filter(pl.col("in_lineup"))
@@ -138,6 +143,43 @@ def game_lines(season: int, wk: int) -> pl.DataFrame:
         ((pl.col("total_hat") - pl.col("margin_hat")) / 2).alias("away_pts")).sort("kickoff_et")
 
 
+def tie_receivers_to_qb(base: pl.DataFrame, alt: pl.DataFrame) -> pl.DataFrame:
+    """In the backup-QB run, scale each team's receiving lines by how much its passing changed.
+
+    The engine's receiver chain sizes targets off the quarterbacks' attempts but prices them with the
+    receiver's own efficiency, so a backup who throws for 175 yards instead of 263 left his receivers
+    on 266 (Dallas, 2026 week 6). Receiving yards, receptions and receiving TDs follow the ratio of the
+    backup's passing yards, completions and passing TDs to the starter's, as the team's receiving and
+    passing lines agree in the main run.
+    """
+    q = lambda f, c: f.filter(pl.col("group") == "QB").group_by("team").agg(pl.col(c).sum())
+    ratio = None
+    for qc, rc in (("passing_yards", "receiving_yards"), ("completions", "receptions"), ("passing_tds", "receiving_tds")):
+        r = q(alt, qc).join(q(base, qc).rename({qc: "_b"}), on="team").with_columns(
+            (pl.col(qc) / pl.col("_b").clip(lower_bound=1e-6)).clip(0.3, 1.5).alias(f"_r_{rc}")).select("team", f"_r_{rc}")
+        ratio = r if ratio is None else ratio.join(r, on="team", how="full", coalesce=True)
+    out = alt.join(ratio, on="team", how="left")
+    skill = pl.col("group") != "QB"
+    out = out.with_columns([pl.when(skill).then(pl.col(rc) * pl.col(f"_r_{rc}").fill_null(1.0)).otherwise(pl.col(rc)).alias(rc)
+                            for rc in ("receiving_yards", "receptions", "receiving_tds") if rc in out.columns])
+    out = out.drop([c for c in out.columns if c.startswith("_r_")])
+    return adjust._fantasy(out)
+
+
+HISTORY_COLS = ["season", "week", "game_id", "team", "opponent", "player_id", "player_name", "position", "completions",
+                "attempts", "passing_yards", "passing_tds", "interceptions", "carries", "rushing_yards", "rushing_tds",
+                "targets", "receptions", "receiving_yards", "receiving_tds", "fantasy_points_ppr"]
+
+
+def history(seasons: int = 3) -> pl.DataFrame:
+    """Recent box scores for the Player page (the cloud app has no engine lake)."""
+    pg = storage.load("player_games", layer="processed", seasons=list(range(C.CURRENT_SEASON - seasons + 1, C.CURRENT_SEASON + 1)))
+    pg = pg.filter(pl.col("position").is_in(list(C.POSITIONS)))
+    snaps = storage.load("player_usage", layer="processed", seasons=list(range(C.CURRENT_SEASON - seasons + 1, C.CURRENT_SEASON + 1)))         .select("game_id", "player_id", "snap_share")
+    g = storage.load("games", layer="processed").select("game_id", "home_team", "kickoff_et")
+    return pg.select([c for c in HISTORY_COLS if c in pg.columns]).join(snaps, on=["game_id", "player_id"], how="left")         .join(g, on="game_id", how="left").with_columns((pl.col("team") == pl.col("home_team")).alias("is_home")).drop("home_team")
+
+
 def build(season: int | None = None, wk: int | None = None, fetch: bool = True, verbose: bool = True) -> dict:
     season = season or C.CURRENT_SEASON
     wk = wk or next_week(season)
@@ -149,7 +191,15 @@ def build(season: int | None = None, wk: int | None = None, fetch: bool = True, 
     cand = who_plays(season, wk)
     players = project(season, wk, cand)
     games = game_lines(season, wk)
+    alt = backup_lineup(cand)
+    players_alt = project(season, wk, alt.with_columns(pl.lit(True).alias("starter")).with_columns(
+        (pl.col("starter") & (pl.col("pos") == "QB")).alias("starter")))
+    players_alt = tie_receivers_to_qb(players, players_alt)
+    expected_lineup_restore = cand.filter(pl.col("in_lineup"))
+    expected.write(expected_lineup_restore.select("season", "week", "team", "player_id", pl.col("pos").alias("position")))
     C.LIVE.mkdir(parents=True, exist_ok=True)
+    players_alt.write_parquet(C.LIVE / "players_backup_qb.parquet")
+    history().write_parquet(C.LIVE / "history.parquet")
     players.write_parquet(C.LIVE / "players.parquet")
     games.write_parquet(C.LIVE / "games.parquet")
     cand.write_parquet(C.LIVE / "candidates.parquet")

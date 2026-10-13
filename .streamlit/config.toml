@@ -1,0 +1,6 @@
+[server]
+port = 8690
+headless = true
+
+[theme]
+primaryColor = "#2a78d6"

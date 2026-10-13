@@ -111,7 +111,7 @@ def _ll(p, y):
 
 def evaluate(tests=(2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026)) -> pl.DataFrame:
     allg = game_rows(list(range(C.FIRST_SEASON, C.CURRENT_SEASON + 1)))
-    rows = []
+    rows, oos = [], []
     for s in tests:
         model = fit(allg.filter(pl.col("season") < s))
         te = allg.filter((pl.col("season") == s) & pl.col("margin").is_not_null() & pl.col("mkt_spread").is_not_null())
@@ -119,6 +119,7 @@ def evaluate(tests=(2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026)) -> pl.DataF
         m, t = p["margin_hat"].to_numpy(), p["total_hat"].to_numpy()
         ym, yt = te["margin"].to_numpy().astype(float), te["total"].to_numpy().astype(float)
         ms, mt = te["mkt_spread"].to_numpy().astype(float), te["mkt_total"].to_numpy().astype(float)
+        oos.append(pl.DataFrame({"season": s, "pred_margin": m, "margin": ym, "pred_total": t, "total": yt}))
         win = (ym > 0).astype(float)
         keep = ym != 0
         sd_mkt = model["margin"]["sd"]
@@ -131,6 +132,7 @@ def evaluate(tests=(2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026)) -> pl.DataF
                      "corr_margin_market": float(np.corrcoef(m, ms)[0, 1]), "corr_total_market": float(np.corrcoef(t, mt)[0, 1]),
                      "sd_margin": model["margin"]["sd"], "sd_total": model["total"]["sd"]})
         print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in rows[-1].items()}, flush=True)
+    pl.concat(oos).write_parquet(C.MODELS / "gamelines_oos.parquet")   # for dist.GameDist (key numbers)
     return pl.DataFrame(rows)
 
 
