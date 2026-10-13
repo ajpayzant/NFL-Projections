@@ -34,10 +34,16 @@ import config as C
 C.engine_on_path()
 from src.data import storage  # noqa: E402
 
-FEATS = ["pos_QB", "pos_RB", "pos_WR", "pos_TE", "years_exp", "week", "n_prior", "team_change",
+# Two feature sets. The week's injury report is published Wednesday to Friday; before it is, a player
+# with no entry is not healthy, he is unreported -- and a model trained on weeks that all had their report
+# read Lamar Jackson (inactive in week 5, nothing reported yet for week 6) as an 86% starter. So the early
+# model sees last week's report and whether he was inactive, and the report model adds this week's.
+EARLY = ["pos_QB", "pos_RB", "pos_WR", "pos_TE", "years_exp", "week", "n_prior", "team_change",
          "prev_played", "prev_snap", "ew_snap", "played_rate_4", "season_share", "games_since",
-         "depth", "depth_missing", "inj_out", "inj_doubtful", "inj_questionable", "prac_dnp", "prac_limited",
-         "prac_full", "qb_prev_start", "qb_ew_share"]
+         "depth", "depth_missing", "qb_prev_start", "qb_ew_share", "prev_inactive", "prev_inj_out",
+         "prev_inj_doubtful", "prev_inj_questionable"]
+REPORT = EARLY + ["inj_out", "inj_doubtful", "inj_questionable", "prac_dnp", "prac_limited", "prac_full"]
+FEATS = REPORT
 PARAMS = {"objective": "binary", "learning_rate": 0.03, "num_leaves": 31, "min_data_in_leaf": 100,
           "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 5.0, "verbose": -1}
 ROUNDS = 400
@@ -168,31 +174,45 @@ def frame(seasons: list[int]) -> pl.DataFrame:
     f = f.with_columns(pl.col("season").cast(pl.Int32), pl.col("week").cast(pl.Int32))
     f = f.join(depth(hist, sched), on=["season", "week", "team", "player_id"], how="left").with_columns(
         pl.col("depth").is_null().cast(pl.Float64).alias("depth_missing"))
-    f = f.join(injuries(hist), on=["season", "week", "team", "player_id"], how="left")
+    inj = injuries(hist)
+    f = f.join(inj, on=["season", "week", "team", "player_id"], how="left")
+    reported = inj.select("season", "week", "team").unique().with_columns(pl.lit(True).alias("has_report"))
+    f = f.join(reported, on=["season", "week", "team"], how="left").with_columns(pl.col("has_report").fill_null(False))
     f = f.with_columns(*[pl.col(c).fill_null(0.0) for c in ("inj_out", "inj_doubtful", "inj_questionable", "prac_dnp",
                                                            "prac_limited", "prac_full")],
                        *[(pl.col("pos") == q).cast(pl.Float64).alias(f"pos_{q}") for q in C.POSITIONS],
                        pl.col("years_exp").cast(pl.Float64), pl.col("week").cast(pl.Float64).alias("week_f"))
     f = f.with_columns(pl.col("week_f").alias("week")).drop("week_f", "_gp_before", "_games_before", "_last_played_idx")
+    f = f.sort("player_id", "kickoff_et").with_columns(
+        (pl.col("status") == "INA").cast(pl.Float64).shift(1).over("player_id").alias("prev_inactive"),
+        *[pl.col(c).shift(1).over("player_id").alias(f"prev_{c}") for c in ("inj_out", "inj_doubtful", "inj_questionable")])
     return f.filter(pl.col("season").is_in(seasons))
 
 
-def _X(f: pl.DataFrame) -> np.ndarray:
-    return f.select([pl.col(c).cast(pl.Float64) for c in FEATS]).to_numpy()
+def _X(f: pl.DataFrame, feats: list[str]) -> np.ndarray:
+    return f.select([pl.col(c).cast(pl.Float64) for c in feats]).to_numpy()
 
 
 def fit(f: pl.DataFrame) -> dict:
     tr = f.filter(pl.col("played").is_not_null())
-    m_play = lgb.train(PARAMS, lgb.Dataset(_X(tr), tr["played"].cast(pl.Int8).to_numpy()), ROUNDS)
     q = tr.filter(pl.col("pos") == "QB")
-    m_start = lgb.train(PARAMS, lgb.Dataset(_X(q), q["started"].cast(pl.Int8).to_numpy()), ROUNDS)
-    return {"play": m_play, "start": m_start, "features": FEATS}
+    out = {"features": {"early": EARLY, "report": REPORT}}
+    for name, feats in (("early", EARLY), ("report", REPORT)):
+        out[f"play_{name}"] = lgb.train(PARAMS, lgb.Dataset(_X(tr, feats), tr["played"].cast(pl.Int8).to_numpy()), ROUNDS)
+        out[f"start_{name}"] = lgb.train(PARAMS, lgb.Dataset(_X(q, feats), q["started"].cast(pl.Int8).to_numpy()), ROUNDS)
+    return out
 
 
-def predict(models: dict, f: pl.DataFrame) -> pl.DataFrame:
-    """p_play for everyone, p_start for QBs normalised to one starter per team-game."""
-    out = f.with_columns(pl.Series("p_play", models["play"].predict(_X(f))))
-    raw = models["start"].predict(_X(f))
+def predict(models: dict, f: pl.DataFrame, force: str | None = None) -> pl.DataFrame:
+    """p_play for everyone, p_start for QBs normalised to one starter per team-game. Each row uses the report
+    model once its team's injury report for the week is out, else the early model (or `force`)."""
+    use = np.full(f.height, force == "report") if force else f["has_report"].to_numpy()
+    pe = models["play_early"].predict(_X(f, EARLY))
+    pr = models["play_report"].predict(_X(f, REPORT))
+    se = models["start_early"].predict(_X(f, EARLY))
+    sr = models["start_report"].predict(_X(f, REPORT))
+    out = f.with_columns(pl.Series("p_play", np.where(use, pr, pe)), pl.Series("model", np.where(use, "report", "early")))
+    raw = np.where(use, sr, se)
     out = out.with_columns(pl.Series("_s", np.where(f["pos"].to_numpy() == "QB", raw, 0.0)))
     out = out.with_columns((pl.col("_s") / pl.col("_s").sum().over("game_id", "team")).fill_nan(0.0).alias("p_start"))
     return out.drop("_s")
@@ -217,7 +237,9 @@ def evaluate(test_seasons=(2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026)) -> p
     rows = []
     for s in test_seasons:
         m = fit(full.filter(pl.col("season") < s))
-        te = predict(m, full.filter((pl.col("season") == s) & pl.col("played").is_not_null()))
+        held = full.filter((pl.col("season") == s) & pl.col("played").is_not_null())
+        early = predict(m, held, force="early")
+        te = predict(m, held, force="report")
         y = te["played"].cast(pl.Float64).to_numpy()
         base = te["prev_played"].fill_null(te["played"].cast(pl.Float64).mean()).to_numpy() * 0.9 + 0.05
         sel = lineup(te)
@@ -226,6 +248,9 @@ def evaluate(test_seasons=(2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026)) -> p
         q = te.filter(pl.col("pos") == "QB")
         top = q.sort("p_start", descending=True).group_by("game_id", "team").first()
         rows.append({"season": s, "n": te.height, "played_rate": y.mean(), "ll_model": _ll(te["p_play"].to_numpy(), y),
+                     "ll_early": _ll(early["p_play"].to_numpy(), y),
+                     "qb_starter_acc_early": float(early.filter(pl.col("pos") == "QB").sort("p_start", descending=True)
+                                                   .group_by("game_id", "team").first()["started"].mean()),
                      "ll_last_game": _ll(base, y), "lineup_precision": tp / max(sel.height, 1),
                      "lineup_recall": tp / max(act.height, 1),
                      "qb_starter_acc": float(top["started"].mean()),
