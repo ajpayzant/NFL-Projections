@@ -1,0 +1,181 @@
+"""The weekly slate: who plays, every player's projection, fantasy points and the game lines.
+
+    python live.py                 # refresh the engine's data, project the next unplayed week
+    python live.py --week 7        # a given week of the current season
+    python live.py --no-refresh    # skip the data refresh (re-project from what is on disk)
+
+Steps:
+  1. refresh     the engine refetches this season's data and rebuilds its processed tables
+  2. who plays   availability.py: P(plays) for every rostered QB/RB/WR/TE and the likeliest QB starter,
+                 with the Depth charts tab's edits on top (overrides.json)
+  3. features    the engine's feature tables, the scheduled week built on that expected lineup
+                 (src.features.expected), so its competition features see who will actually play
+  4. project     the engine's forward pass on the lineup, then the correction layer (correct.py)
+  5. price       fantasy points (PPR / half / standard) with ranges; game lines from gamelines.py
+  6. save        data/live/: players.parquet, games.parquet, candidates.parquet, meta.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pickle
+import subprocess
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import polars as pl
+
+import availability as A
+import config as C
+import correct
+import gamelines as G
+
+C.engine_on_path()
+from src.data import storage  # noqa: E402
+from src.features import expected  # noqa: E402
+from src.projections import week as engine_week  # noqa: E402
+
+ET = ZoneInfo("America/New_York")
+OVERRIDE_FILE = C.OVERRIDES / "overrides.json"
+STAT_GROUP = {"QB": "QB", "RB": "RB", "WR": "WR+TE", "TE": "WR+TE"}
+
+
+def _engine(script: list[str]) -> None:
+    r = subprocess.run([sys.executable, *script], cwd=C.ENGINE, capture_output=True, text=True,
+                       env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"})
+    if r.returncode != 0:
+        raise RuntimeError(f"engine {' '.join(script)} failed:\n{(r.stdout + r.stderr)[-2000:]}")
+
+
+def refresh(season: int, wk: int) -> None:
+    _engine(["scripts/run_week.py", "--season", str(season), "--week", str(wk), "--only", "update"])
+
+
+def next_week(season: int = C.CURRENT_SEASON) -> int | None:
+    g = storage.load("games", layer="processed", seasons=[season]).filter(
+        (pl.col("season_type") == "REG") & ~pl.col("is_played"))
+    return int(g["week"].min()) if g.height else None
+
+
+# ---------------------------------------------------------------- who plays
+
+def load_overrides() -> dict:
+    return json.loads(OVERRIDE_FILE.read_text()) if OVERRIDE_FILE.exists() else {}
+
+
+def who_plays(season: int, wk: int) -> pl.DataFrame:
+    """Every candidate with p_play / p_start, the model's call, and the user's edits applied."""
+    models = pickle.load(open(A.MODEL_FILE, "rb"))
+    pred = A.predict(models, A.frame([season]).filter(pl.col("week") == wk))
+    lu = A.lineup(pred).with_columns(pl.lit(True).alias("in_lineup"))
+    pred = pred.join(lu, on=["game_id", "team", "player_id"], how="left").with_columns(
+        pl.col("in_lineup").fill_null(False))
+    pred = pred.with_columns((pl.col("in_lineup") & (pl.col("pos") == "QB")).alias("starter"),
+                             pl.lit("model").alias("source"))
+    for k, v in load_overrides().items():          # "season:week:team" -> {"out": [...], "in": [...], "qb": id}
+        s, w, team = k.split(":")
+        if int(s) != season or int(w) != wk:
+            continue
+        t = pl.col("team") == team
+        if v.get("out"):
+            pred = pred.with_columns(pl.when(t & pl.col("player_id").is_in(v["out"])).then(False).otherwise(pl.col("in_lineup")).alias("in_lineup"))
+        if v.get("in"):
+            pred = pred.with_columns(pl.when(t & pl.col("player_id").is_in(v["in"])).then(True).otherwise(pl.col("in_lineup")).alias("in_lineup"))
+        if v.get("qb"):
+            q = t & (pl.col("pos") == "QB")
+            pred = pred.with_columns(
+                pl.when(q).then(pl.col("player_id") == v["qb"]).otherwise(pl.col("starter")).alias("starter"))
+            pred = pred.with_columns(pl.when(q).then(pl.col("starter")).otherwise(pl.col("in_lineup")).alias("in_lineup"))
+        pred = pred.with_columns(pl.when(t).then(pl.lit("manual override")).otherwise(pl.col("source")).alias("source"))
+    return pred
+
+
+# ---------------------------------------------------------------- the slate
+
+def project(season: int, wk: int, cand: pl.DataFrame) -> pl.DataFrame:
+    lineup = cand.filter(pl.col("in_lineup"))
+    expected.write(lineup.select("season", "week", "team", "player_id", pl.col("pos").alias("position")))
+    _engine(["scripts/build_features.py", "--seasons", str(season), "--include-scheduled"])
+    fc = engine_week.project(season, wk, lineup=lineup.select("team", "player_id"))
+    model = correct.load()
+    p = correct.apply(model, fc.players, season, wk)
+    p = p.join(cand.select("game_id", "player_id", "p_play", "p_start", "starter", "source", "depth", "inj_out",
+                           "inj_doubtful", "inj_questionable", "years_exp"), on=["game_id", "player_id"], how="left")
+    # fantasy points and their ranges
+    for name, rp in correct.SCORING.items():
+        p = p.with_columns(correct.fantasy(p, rp).alias(name))
+    parts = []
+    for group, g in p.group_by("group"):
+        group = group[0]
+        cols = {}
+        for name in ("fantasy_ppr", "fantasy_half", "fantasy_std"):
+            emp = model["dist"][f"{group}|{name}"]["emp"]
+            mu = g[name].to_numpy()
+            for q in (0.1, 0.5, 0.9):
+                cols[f"{name}_p{int(q * 100)}"] = emp.quantile(mu, q)
+        tds = [c for c in ("rushing_tds", "receiving_tds") if c in g.columns]
+        anytime = g.select(pl.sum_horizontal([pl.col(c).fill_null(0) for c in tds])).to_series().to_numpy()
+        cols["anytime_td"] = anytime
+        cols["p_anytime_td"] = model["dist"][f"{group}|anytime_td"]["emp"].p_at_least_one(anytime)
+        parts.append(g.with_columns([pl.Series(k, v) for k, v in cols.items()]))
+    p = pl.concat(parts, how="diagonal")
+    games = storage.load("games", layer="processed", seasons=[season]).filter(pl.col("week") == wk)
+    opp = pl.concat([games.select("game_id", pl.col("home_team").alias("team"), pl.col("away_team").alias("opp"), pl.lit(True).alias("is_home")),
+                     games.select("game_id", pl.col("away_team").alias("team"), pl.col("home_team").alias("opp"), pl.lit(False).alias("is_home"))])
+    return p.join(opp, on=["game_id", "team"], how="left").with_columns(pl.lit(season).alias("season"), pl.lit(wk).alias("week"))
+
+
+def game_lines(season: int, wk: int) -> pl.DataFrame:
+    model = pickle.load(open(G.FILE, "rb"))
+    rows = G.game_rows([season]).filter(pl.col("week") == wk)
+    out = G.predict(model, rows)
+    g = storage.load("games", layer="processed", seasons=[season]).select(
+        "game_id", "kickoff_et", "home_score", "away_score", "roof", "temp", "wind", "spread_line", "total_line")
+    return out.join(g, on="game_id", how="left").with_columns(
+        ((pl.col("total_hat") + pl.col("margin_hat")) / 2).alias("home_pts"),
+        ((pl.col("total_hat") - pl.col("margin_hat")) / 2).alias("away_pts")).sort("kickoff_et")
+
+
+def build(season: int | None = None, wk: int | None = None, fetch: bool = True, verbose: bool = True) -> dict:
+    season = season or C.CURRENT_SEASON
+    wk = wk or next_week(season)
+    if wk is None:
+        raise SystemExit(f"no unplayed regular-season week left in {season}")
+    if fetch:
+        refresh(season, wk)
+        wk = next_week(season) if wk is None else wk
+    cand = who_plays(season, wk)
+    players = project(season, wk, cand)
+    games = game_lines(season, wk)
+    C.LIVE.mkdir(parents=True, exist_ok=True)
+    players.write_parquet(C.LIVE / "players.parquet")
+    games.write_parquet(C.LIVE / "games.parquet")
+    cand.write_parquet(C.LIVE / "candidates.parquet")
+    meta = {"season": season, "week": wk, "built_at": datetime.now(ET).isoformat(timespec="minutes"),
+            "players": players.height, "games": games.height}
+    (C.LIVE / "meta.json").write_text(json.dumps(meta))
+    if verbose:
+        print(f"{season} week {wk}: {games.height} games, {players.height} players projected "
+              f"({int(cand['in_lineup'].sum())} of {cand.height} rostered expected to play)")
+    return meta
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--week", type=int)
+    ap.add_argument("--season", type=int, default=C.CURRENT_SEASON)
+    ap.add_argument("--no-refresh", action="store_true")
+    a = ap.parse_args()
+    build(a.season, a.week, fetch=not a.no_refresh)
+    p = pl.read_parquet(C.LIVE / "players.parquet")
+    show = ["player_name", "team", "opp", "projected_position", "p_play", "fantasy_ppr", "fantasy_ppr_p10", "fantasy_ppr_p90"]
+    print(p.sort("fantasy_ppr", descending=True).select(show).head(15).to_pandas().round(2).to_string(index=False))
+    g = pl.read_parquet(C.LIVE / "games.parquet")
+    print(g.select("away", "home", "away_pts", "home_pts", "margin_hat", "total_hat", "p_home", "spread_line", "total_line")
+          .to_pandas().round(2).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
