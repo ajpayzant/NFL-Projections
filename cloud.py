@@ -17,7 +17,7 @@ import requests
 
 import config as C
 
-DEFAULT_REPO = "ajpayzant/NFL-Game-Projections"
+DEFAULT_REPO = "ajpayzant/NFL-Projections"
 TAG = "data"
 ASSETS = {"meta.json": C.LIVE / "meta.json",
           "players.parquet": C.LIVE / "players.parquet",

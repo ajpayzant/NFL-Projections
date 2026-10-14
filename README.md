@@ -48,7 +48,7 @@ runs on the machine with the engine and uploads its outputs to this repo's relea
 
 | Setting | Value |
 |---|---|
-| Repository / branch / main file | `ajpayzant/NFL-Game-Projections` / `main` / `app.py` |
+| Repository / branch / main file | `ajpayzant/NFL-Projections` / `main` / `app.py` |
 | Python version | 3.13 or 3.14 |
 
 Secrets (TOML):

@@ -6,3 +6,4 @@ dist/
 .streamlit/secrets.toml
 research/*.parquet
 research/*.csv
+research/shots/
